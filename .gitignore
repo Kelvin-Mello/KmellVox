@@ -1,0 +1,45 @@
+# Python environment
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# Models & Weights (Não versionar pesos pesados)
+models/*
+!models/.gitkeep
+*.gguf
+*.bin
+*.pth
+*.pt
+*.safetensors
+*.onnx
+
+# Tools & Binaries
+tools/ffmpeg/
+*.exe
+*.dll
+
+# Outputs & Temp
+temp/
+output/
+*.mp4
+*.wav
+*.mp3
+*.srt
+*.log
+
+# PyInstaller / Packaging
+build/
+dist/
+*.spec.bak
+
+# IDE & OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

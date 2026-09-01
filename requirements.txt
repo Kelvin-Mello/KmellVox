@@ -1,0 +1,22 @@
+# ==============================================================================
+# KmellVox - Requisitos de Dependências
+# ==============================================================================
+# Para aceleração total por GPU (CUDA/cuBLAS) no llama-cpp-python, instale com:
+#   PowerShell (Windows):
+#     $env:CMAKE_ARGS = "-DGGML_CUDA=on"
+#     pip install llama-cpp-python --force-reinstall --no-cache-dir
+#   Linux/Bash:
+#     CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --force-reinstall --no-cache-dir
+
+ffmpeg-python>=0.2.0
+PySide6>=6.6.0
+faster-whisper>=1.0.0
+llama-cpp-python>=0.2.75
+huggingface_hub>=0.20.0
+tqdm>=4.66.0
+numpy>=1.24.0,<2.0.0
+soundfile>=0.12.1
+pyinstaller>=6.0.0
+pyyaml>=6.0.1
+pydantic>=2.0.0
+psutil>=5.9.0

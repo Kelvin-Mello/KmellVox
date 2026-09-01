@@ -1,0 +1,69 @@
+app:
+  description: Pipeline Inteligente de Dublagem, Clonagem de Voz e Lip Sync
+  name: KmellVox
+  version: 1.0.0
+gpu_profile: cpu
+hardware:
+  compute_type: float16
+  device: cuda
+  device_name: NVIDIA GeForce RTX 5060 Laptop GPU
+  profile: mid_vram
+  vram_detected_gb: 7.96
+language:
+  default_source_language: auto
+  default_target_language: pt
+  supported_languages:
+  - code: en
+    name: Inglês
+  - code: pt
+    name: Português
+  - code: es
+    name: Espanhol
+  - code: fr
+    name: Francês
+  - code: de
+    name: Alemão
+  - code: it
+    name: Italiano
+  - code: ja
+    name: Japonês
+  - code: zh
+    name: Chinês
+models:
+  lipsync:
+    batch_size: 8
+    bbox_shift: 0
+    engine: musetalk-1.5
+    face_detect_confidence: 0.85
+  transcription:
+    beam_size: 5
+    model_size: medium
+    provider: faster-whisper
+    vad_filter: true
+    vad_min_silence_duration_ms: 500
+  translation:
+    context_window: 4096
+    filename: qwen2.5-7b-instruct-q4_k_m.gguf
+    model_family: Qwen3
+    n_gpu_layers: -1
+    provider: llama-cpp-python
+    repo_id: Qwen/Qwen2.5-7B-Instruct-GGUF
+    temperature: 0.3
+  voice_clone:
+    cross_fade_duration: 0.15
+    engine: f5-tts
+    reference_sample_rate: 24000
+paths:
+  ffmpeg_bin: tools/ffmpeg/bin/ffmpeg.exe
+  ffprobe_bin: tools/ffmpeg/bin/ffprobe.exe
+  models_dir: models
+  output_dir: output
+  temp_dir: temp
+pipeline:
+  audio_bitrate: 192k
+  audio_codec: aac
+  audio_sync_speed_limit: 1.25
+  keep_temp_files: false
+  subtitle_burn_in: false
+  subtitle_export_srt: true
+  video_codec: libx264
