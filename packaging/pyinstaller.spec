@@ -8,18 +8,18 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
 
-# Diretório base do projeto
-PROJECT_ROOT = Path('.').resolve()
+# Diretório base do projeto (um nível acima de packaging/)
+PROJECT_ROOT = Path(SPECPATH).parent.resolve()
 
 datas = [
-    ('config.yaml', '.'),
-    ('models/.gitkeep', 'models'),
+    (str(PROJECT_ROOT / 'config.yaml'), '.'),
+    (str(PROJECT_ROOT / 'models' / '.gitkeep'), 'models'),
 ]
 
 # Inclui binários do FFmpeg caso estejam empacotados localmente em tools/ffmpeg/bin/
 ffmpeg_dir = PROJECT_ROOT / 'tools' / 'ffmpeg' / 'bin'
 if ffmpeg_dir.exists():
-    datas.append(('tools/ffmpeg/bin/*', 'tools/ffmpeg/bin'))
+    datas.append((str(ffmpeg_dir / '*'), 'tools/ffmpeg/bin'))
 
 # Coleta de assets e pacotes dependentes
 datas += collect_data_files('PySide6')
@@ -74,8 +74,8 @@ excludes = [
 ]
 
 a = Analysis(
-    ['main.py'],
-    pathex=['.'],
+    [str(PROJECT_ROOT / 'main.py')],
+    pathex=[str(PROJECT_ROOT)],
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
