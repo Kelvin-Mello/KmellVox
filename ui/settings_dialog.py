@@ -257,8 +257,9 @@ class SettingsDialog(QDialog):
         self.downloader_worker.start()
 
     def _on_dl_progress(self, pct: float, msg: str) -> None:
-        self.prog_bar_dl.setValue(int(pct * 100))
-        self.lbl_dl_status.setText(f"{int(pct * 100)}% - {msg}")
+        int_pct = max(0, min(100, int(round(pct * 100))))
+        self.prog_bar_dl.setValue(int_pct)
+        self.lbl_dl_status.setText(f"{int_pct}% - {msg}")
 
     def _on_dl_finished(self, saved_paths: dict) -> None:
         self.prog_bar_dl.setValue(100)

@@ -37,6 +37,41 @@ class SafeTqdm(tqdm):
         super().__init__(*args, **kwargs)
 
 
+def create_hf_progress_tqdm(
+    spec_idx: int,
+    total_specs: int,
+    spec_name: str,
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+):
+    """
+    Cria uma classe tqdm personalizada para o huggingface_hub que encaminha o progresso
+    granular de bytes baixados para a interface gráfica em tempo real.
+    """
+    class HFDownloadProgressTqdm(tqdm):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            if "file" not in kwargs or kwargs["file"] is None:
+                kwargs["file"] = sys.stderr if sys.stderr and hasattr(sys.stderr, "write") else SafeStream()
+            super().__init__(*args, **kwargs)
+
+        def update(self, n: int = 1) -> None:
+            super().update(n)
+            if progress_callback:
+                if self.total and self.total > 0:
+                    file_pct = max(0.0, min(1.0, self.n / self.total))
+                    overall_pct = ((spec_idx - 1) + file_pct) / total_specs
+                    cur_mb = self.n / (1024 * 1024)
+                    tot_mb = self.total / (1024 * 1024)
+                    msg = f"[{spec_idx}/{total_specs}] {spec_name}: {cur_mb:.1f} MB / {tot_mb:.1f} MB ({file_pct * 100:.1f}%)"
+                    progress_callback(overall_pct, msg)
+                else:
+                    cur_mb = self.n / (1024 * 1024)
+                    overall_pct = (spec_idx - 0.5) / total_specs
+                    msg = f"[{spec_idx}/{total_specs}] {spec_name}: {cur_mb:.1f} MB transferidos..."
+                    progress_callback(overall_pct, msg)
+
+    return HFDownloadProgressTqdm
+
+
 @dataclass
 class ModelDownloadSpec:
     """Especificação de download de um modelo da HuggingFace."""
@@ -317,7 +352,14 @@ def fetch_models_for_profile(
                 pbar.update(1)
                 continue
 
-            # 2. Download via huggingface_hub com suporte nativo a resume e SafeTqdm
+            # 2. Download via huggingface_hub com suporte nativo a resume e progresso em tempo real
+            progress_tqdm_cls = create_hf_progress_tqdm(
+                spec_idx=idx,
+                total_specs=total_specs,
+                spec_name=spec.name,
+                progress_callback=progress_callback,
+            )
+
             try:
                 if spec.filename:
                     logger.info("Baixando arquivo '%s' do repositório '%s'...", spec.filename, spec.repo_id)
@@ -325,7 +367,7 @@ def fetch_models_for_profile(
                         repo_id=spec.repo_id,
                         filename=spec.filename,
                         local_dir=str(dest_target.parent),
-                        tqdm_class=SafeTqdm,
+                        tqdm_class=progress_tqdm_cls,
                     )
                     if Path(downloaded_path) != dest_target and not dest_target.exists():
                         try:
@@ -338,7 +380,7 @@ def fetch_models_for_profile(
                     snapshot_download(
                         repo_id=spec.repo_id,
                         local_dir=str(dest_target),
-                        tqdm_class=SafeTqdm,
+                        tqdm_class=progress_tqdm_cls,
                     )
                     saved_paths[spec.category] = str(dest_target)
 
