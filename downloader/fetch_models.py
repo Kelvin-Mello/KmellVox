@@ -14,12 +14,10 @@ from typing import Any, Callable, Dict, List, Optional
 # Garante que a raiz do projeto esteja no sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# Garante UTF-8 no stdout do Windows se disponível
-if sys.stdout and hasattr(sys.stdout, "reconfigure"):
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+from core.safe_streams import SafeStream, ensure_safe_streams
+
+# Garante streams válidos antes de qualquer import de terceiros
+ensure_safe_streams()
 
 import yaml
 from huggingface_hub import hf_hub_download, snapshot_download
@@ -28,6 +26,15 @@ from tqdm import tqdm
 from core.hardware import ModelProfile, detect_gpu_profile, sync_hardware_config
 
 logger = logging.getLogger("KmellVox.Downloader")
+
+
+class SafeTqdm(tqdm):
+    """Subclasse do tqdm que garante que 'file' nunca seja None em ambientes GUI ou PyInstaller."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        if "file" not in kwargs or kwargs["file"] is None:
+            kwargs["file"] = sys.stderr if sys.stderr and hasattr(sys.stderr, "write") else SafeStream()
+        super().__init__(*args, **kwargs)
 
 
 @dataclass
@@ -44,38 +51,40 @@ class ModelDownloadSpec:
     expected_min_bytes: int = 1024
 
 
-# Registro de modelos mapeados estritamente por perfil
+# ==============================================================================
+# Catálogo Canônico de Modelos do KmellVox por Perfil de Hardware
+# ==============================================================================
 MODEL_CATALOG: List[ModelDownloadSpec] = [
-    # 1. Faster-Whisper
+    # 1. Faster-Whisper (Transcrição)
     ModelDownloadSpec(
         key="whisper_large_v3",
-        name="Faster-Whisper Large-v3",
+        name="Faster-Whisper large-v3",
         category="transcription",
         repo_id="Systran/faster-whisper-large-v3",
         destination_rel="whisper/large-v3",
         profiles=["perfil_a"],
-        description="Whisper Large-v3 (Precisão máxima para perfil_a 8GB+)",
-        expected_min_bytes=1000 * 1024 * 1024,
+        description="Whisper large-v3 FP16 (Precisão máxima para perfil_a 8GB+)",
+        expected_min_bytes=1500 * 1024 * 1024,
     ),
     ModelDownloadSpec(
         key="whisper_distil_large_v3",
-        name="Faster-Distil-Whisper Large-v3",
+        name="Faster-Whisper distil-large-v3",
         category="transcription",
         repo_id="Systran/faster-distil-whisper-large-v3",
         destination_rel="whisper/distil-large-v3",
         profiles=["perfil_b"],
-        description="Distil-Whisper Large-v3 (Alta precisão e velocidade para perfil_b 6GB)",
-        expected_min_bytes=500 * 1024 * 1024,
+        description="Whisper distil-large-v3 (Otimizado para perfil_b 6GB VRAM)",
+        expected_min_bytes=750 * 1024 * 1024,
     ),
     ModelDownloadSpec(
         key="whisper_small",
-        name="Faster-Whisper Small",
+        name="Faster-Whisper small",
         category="transcription",
         repo_id="Systran/faster-whisper-small",
         destination_rel="whisper/small",
         profiles=["cpu"],
-        description="Whisper Small (Otimizado para execução rápida em CPU)",
-        expected_min_bytes=200 * 1024 * 1024,
+        description="Whisper small INT8 (Leve para execução em CPU)",
+        expected_min_bytes=240 * 1024 * 1024,
     ),
 
     # 2. LLM Qwen3 GGUF (Tradução)
@@ -113,40 +122,39 @@ MODEL_CATALOG: List[ModelDownloadSpec] = [
         expected_min_bytes=800 * 1024 * 1024,
     ),
 
-    # 3. F5-TTS (Ambos os perfis de GPU e CPU)
+    # 3. F5-TTS (Clonagem de Voz Padrão) - Ambos os perfis e CPU
     ModelDownloadSpec(
         key="f5_tts_base",
-        name="F5-TTS Base Checkpoint",
+        name="F5-TTS (Modelo Base Multilíngue)",
         category="voice_clone",
         repo_id="SWivid/F5-TTS",
-        filename="F5TTS_Base/model_1200000.safetensors",
-        destination_rel="tts/f5tts_base.safetensors",
+        destination_rel="tts/f5-tts",
         profiles=["perfil_a", "perfil_b", "cpu"],
-        description="Pesos pré-treinados do F5-TTS para clonagem de voz zero-shot",
+        description="Motor F5-TTS padrão de clonagem com controle de ritmo via atempo",
         expected_min_bytes=500 * 1024 * 1024,
     ),
 
-    # 4. IndexTTS-2 (Apenas perfil_a 8GB+)
+    # 4. IndexTTS-2 (Clonagem Avançada FP16) - Somente perfil_a (8GB+ VRAM)
     ModelDownloadSpec(
-        key="indextts_2",
-        name="IndexTTS-2 High-Quality Checkpoints",
-        category="voice_clone",
+        key="indextts_2_fp16",
+        name="IndexTTS-2 (Qualidade Máxima de Voz)",
+        category="voice_clone_indextts2",
         repo_id="IndexTeam/IndexTTS-2",
         destination_rel="tts/indextts-2",
         profiles=["perfil_a"],
-        description="Pesos oficiais do IndexTTS-2 com controle explícito nativo de duração",
-        expected_min_bytes=800 * 1024 * 1024,
+        description="Motor avançado IndexTTS-2 com controle explícito nativo de duração (8GB+)",
+        expected_min_bytes=1200 * 1024 * 1024,
     ),
 
-    # 5. MuseTalk 1.5 Checkpoints (Ambos os perfis perfil_a e perfil_b)
+    # 5. MuseTalk 1.5 (Sincronia Labial Facial) - Ambos os perfis
     ModelDownloadSpec(
-        key="musetalk_checkpoints",
-        name="MuseTalk 1.5 UNet & Facial Models",
+        key="musetalk_1_5_core",
+        name="MuseTalk 1.5 (Checkpoints Principais)",
         category="lipsync",
         repo_id="TMElyralab/MuseTalk",
         destination_rel="musetalk",
         profiles=["perfil_a", "perfil_b"],
-        description="Checkpoints oficiais do MuseTalk 1.5 para sincronização labial facial",
+        description="Checkpoints de sincronia labial MuseTalk 1.5 (FP16/FP32)",
         expected_min_bytes=600 * 1024 * 1024,
     ),
 ]
@@ -269,6 +277,8 @@ def fetch_models_for_profile(
     Baixa apenas os arquivos e checkpoints necessários para o perfil de hardware detectado/selecionado,
     verificando integridade e salvando os caminhos finais em config.yaml.
     """
+    ensure_safe_streams()
+
     if profile is None:
         profile = detect_gpu_profile(config_path=config_path)
 
@@ -287,17 +297,17 @@ def fetch_models_for_profile(
     if progress_callback:
         progress_callback(0.02, f"Iniciando download para perfil '{profile}' ({total_specs} modelos)...")
 
-    with tqdm(total=total_specs, desc=f"Modelos ({profile})", unit="model") as pbar:
+    # Utiliza SafeTqdm para garantir que 'file' nunca seja None em ambientes GUI
+    with SafeTqdm(total=total_specs, desc=f"Modelos ({profile})", unit="model") as pbar:
         for idx, spec in enumerate(target_specs, 1):
             dest_target = base / spec.destination_rel
             dest_target.parent.mkdir(parents=True, exist_ok=True)
 
             stage_pct = (idx - 1) / total_specs
-            step_msg = f"[{idx}/{total_specs}] {spec.name}"
             logger.info("Processando: %s (Repo: %s)...", spec.name, spec.repo_id)
 
             if progress_callback:
-                progress_callback(stage_pct, f"Verificando/Baixando: {spec.name}...")
+                progress_callback(stage_pct, f"Verificando/Baixando ({idx}/{total_specs}): {spec.name}...")
 
             # 1. Verifica se já está instalado
             if not force_download and verify_file_or_dir_exists(dest_target, spec.expected_min_bytes):
@@ -307,7 +317,7 @@ def fetch_models_for_profile(
                 pbar.update(1)
                 continue
 
-            # 2. Download via huggingface_hub com suporte nativo a resume
+            # 2. Download via huggingface_hub com suporte nativo a resume e SafeTqdm
             try:
                 if spec.filename:
                     logger.info("Baixando arquivo '%s' do repositório '%s'...", spec.filename, spec.repo_id)
@@ -315,6 +325,7 @@ def fetch_models_for_profile(
                         repo_id=spec.repo_id,
                         filename=spec.filename,
                         local_dir=str(dest_target.parent),
+                        tqdm_class=SafeTqdm,
                     )
                     if Path(downloaded_path) != dest_target and not dest_target.exists():
                         try:
@@ -327,6 +338,7 @@ def fetch_models_for_profile(
                     snapshot_download(
                         repo_id=spec.repo_id,
                         local_dir=str(dest_target),
+                        tqdm_class=SafeTqdm,
                     )
                     saved_paths[spec.category] = str(dest_target)
 
@@ -334,6 +346,9 @@ def fetch_models_for_profile(
 
             except Exception as e:
                 logger.error("Falha ao baixar '%s' da HuggingFace: %s", spec.name, e)
+                # Propaga o erro caso não consiga baixar e o arquivo não exista
+                if not dest_target.exists():
+                    raise RuntimeError(f"Erro ao baixar {spec.name} ({spec.repo_id}): {e}") from e
                 saved_paths[spec.category] = str(dest_target)
 
             pbar.update(1)

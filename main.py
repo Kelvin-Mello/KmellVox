@@ -15,6 +15,11 @@ from core.pipeline import DubbingPipeline, PipelineConfig
 from downloader.fetch_models import check_models_status, fetch_models_for_profile
 from ui.main_window import MainWindow
 
+from core.safe_streams import ensure_safe_streams
+
+# Garante que sys.stdout e sys.stderr nunca sejam None em aplicações GUI / PyInstaller
+ensure_safe_streams()
+
 # Configuração de Logging global
 logging.basicConfig(
     level=logging.INFO,

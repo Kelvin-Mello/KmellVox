@@ -10,10 +10,13 @@ from unittest.mock import MagicMock, patch
 import yaml
 
 # Garante que a raiz do projeto esteja no sys.path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
+from core.safe_streams import SafeStream, ensure_safe_streams
 from downloader.fetch_models import (
     MODEL_CATALOG,
+    SafeTqdm,
     check_models_status,
     fetch_models_for_profile,
     update_config_model_paths,
@@ -39,22 +42,22 @@ class TestFetchModels(unittest.TestCase):
         # 1. perfil_a (8GB+) deve incluir IndexTTS-2 e Whisper Large-v3
         statuses_a = check_models_status(profile="perfil_a", base_models_dir=self.temp_dir.name, config_path=self.dummy_config)
         names_a = [s["name"] for s in statuses_a]
-        self.assertTrue(any("IndexTTS-2" in n for n in names_a))
-        self.assertTrue(any("Large-v3" in n for n in names_a))
-        self.assertTrue(any("Qwen3-8B" in n for n in names_a))
+        self.assertTrue(any("indextts-2" in n.lower() for n in names_a))
+        self.assertTrue(any("large-v3" in n.lower() for n in names_a))
+        self.assertTrue(any("qwen3-8b" in n.lower() for n in names_a))
 
         # 2. perfil_b (6GB) NÃO deve incluir IndexTTS-2 e deve incluir Distil-Large-v3 e Qwen3-4B
         statuses_b = check_models_status(profile="perfil_b", base_models_dir=self.temp_dir.name, config_path=self.dummy_config)
         names_b = [s["name"] for s in statuses_b]
-        self.assertFalse(any("IndexTTS-2" in n for n in names_b))
-        self.assertTrue(any("Distil" in n for n in names_b))
-        self.assertTrue(any("Qwen3-4B" in n for n in names_b))
+        self.assertFalse(any("indextts-2" in n.lower() for n in names_b))
+        self.assertTrue(any("distil" in n.lower() for n in names_b))
+        self.assertTrue(any("qwen3-4b" in n.lower() for n in names_b))
 
         # 3. cpu deve incluir Whisper Small e Qwen3-1.5B
         statuses_cpu = check_models_status(profile="cpu", base_models_dir=self.temp_dir.name, config_path=self.dummy_config)
         names_cpu = [s["name"] for s in statuses_cpu]
-        self.assertTrue(any("Small" in n for n in names_cpu))
-        self.assertTrue(any("1.5B" in n for n in names_cpu))
+        self.assertTrue(any("small" in n.lower() for n in names_cpu))
+        self.assertTrue(any("1.5b" in n.lower() for n in names_cpu))
 
     @patch("downloader.fetch_models.hf_hub_download")
     @patch("downloader.fetch_models.snapshot_download")
@@ -90,6 +93,39 @@ class TestFetchModels(unittest.TestCase):
         # Valida callbacks de progresso atingindo 100%
         self.assertGreater(len(progress_calls), 0)
         self.assertEqual(progress_calls[-1][0], 1.0)
+
+    @patch("downloader.fetch_models.hf_hub_download")
+    @patch("downloader.fetch_models.snapshot_download")
+    def test_gui_null_streams_safe_download(self, mock_snapshot, mock_hf_download):
+        """
+        Simula ambiente PyInstaller/GUI onde sys.stdout e sys.stderr são None,
+        garantindo que o download execute perfeitamente sem 'NoneType object has no attribute write'.
+        """
+        orig_stdout = sys.stdout
+        orig_stderr = sys.stderr
+
+        try:
+            # Simula streams nulos
+            sys.stdout = None
+            sys.stderr = None
+
+            mock_hf_download.side_effect = lambda repo_id, filename, local_dir, **kw: os.path.join(local_dir, filename)
+            mock_snapshot.return_value = self.temp_dir.name
+
+            # SafeTqdm e ensure_safe_streams não devem levantar exceção
+            ensure_safe_streams()
+            with SafeTqdm(total=3) as pbar:
+                pbar.update(1)
+
+            saved = fetch_models_for_profile(
+                profile="cpu",
+                base_models_dir=self.temp_dir.name,
+                config_path=self.dummy_config,
+            )
+            self.assertTrue(len(saved) > 0)
+        finally:
+            sys.stdout = orig_stdout
+            sys.stderr = orig_stderr
 
     def test_resume_and_verification_skips_existing(self):
         """Testa se arquivos já existentes no disco não são baixados novamente."""
