@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unicodedata
@@ -209,7 +210,11 @@ class NarrationEngine:
         else:
             self.model_profile = model_profile
 
-        self.models_dir = models_dir
+        if models_dir == "models" and getattr(sys, "frozen", False):
+            self.models_dir = str((Path(sys.executable).parent / "models").resolve())
+        else:
+            self.models_dir = str(Path(models_dir).resolve())
+
         self.ffmpeg_bin = ffmpeg_bin or resolve_ffmpeg_binary()
         self.is_cancelled: bool = False
 
@@ -256,7 +261,14 @@ class NarrationEngine:
         ]
 
         logger.debug("Executando conversão MP3: %s", " ".join(cmd))
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
         if proc.returncode != 0:
             logger.warning("Falha no FFmpeg para converter MP3: %s. Copiando original.", proc.stderr)
             if not out_path.exists():
@@ -308,7 +320,14 @@ class NarrationEngine:
                 str(out_path),
             ]
 
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
             if proc.returncode != 0:
                 raise RuntimeError(f"Erro no FFmpeg concat: {proc.stderr}")
 

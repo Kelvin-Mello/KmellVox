@@ -17,9 +17,13 @@ datas = [
 ]
 
 # Inclui binários do FFmpeg caso estejam empacotados localmente em tools/ffmpeg/bin/
-ffmpeg_dir = PROJECT_ROOT / 'tools' / 'ffmpeg' / 'bin'
-if ffmpeg_dir.exists():
-    datas.append((str(ffmpeg_dir / '*'), 'tools/ffmpeg/bin'))
+binaries = []
+ffmpeg_exe = PROJECT_ROOT / 'tools' / 'ffmpeg' / 'bin' / 'ffmpeg.exe'
+ffprobe_exe = PROJECT_ROOT / 'tools' / 'ffmpeg' / 'bin' / 'ffprobe.exe'
+if ffmpeg_exe.is_file():
+    binaries.append((str(ffmpeg_exe), 'tools/ffmpeg/bin'))
+if ffprobe_exe.is_file():
+    binaries.append((str(ffprobe_exe), 'tools/ffmpeg/bin'))
 
 # Coleta de assets e pacotes dependentes
 datas += collect_data_files('PySide6')
@@ -79,7 +83,7 @@ excludes = [
 a = Analysis(
     [str(PROJECT_ROOT / 'main.py')],
     pathex=[str(PROJECT_ROOT)],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

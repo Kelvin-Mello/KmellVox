@@ -546,10 +546,15 @@ class NarrationTab(QWidget):
         self.lbl_job_stage.setText("Iniciando processamento da fila de narração...")
 
         hw = detect_hardware()
+        if getattr(sys, "frozen", False):
+            resolved_models_dir = str((Path(sys.executable).parent / "models").resolve())
+        else:
+            resolved_models_dir = str(Path("models").resolve())
+
         self.worker_thread = NarrationWorkerThread(
             jobs=pending,
             model_profile=hw.model_profile,
-            models_dir="models",
+            models_dir=resolved_models_dir,
             parent=self,
         )
         self.worker_thread.progress_signal.connect(self._on_worker_progress)
@@ -602,6 +607,7 @@ class NarrationTab(QWidget):
     def _on_job_error(self, job_id: str, err: str) -> None:
         if job_id in self.queue_jobs:
             self.queue_jobs[job_id].status = "Erro"
+            self.queue_jobs[job_id].status_message = err
 
         for row in range(self.table_queue.rowCount()):
             item = self.table_queue.item(row, 0)
@@ -610,8 +616,10 @@ class NarrationTab(QWidget):
                 if st_item:
                     st_item.setText("❌ Erro")
                     st_item.setForeground(Qt.red)
+                    st_item.setToolTip(f"Erro:\n{err}")
                 break
 
+        self.lbl_job_stage.setText(f"❌ Erro na narração: {err}")
         self.log_signal.emit(f"❌ Erro na narração ({job_id}): {err}")
 
     def _on_queue_completed(self) -> None:

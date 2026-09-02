@@ -7,6 +7,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -36,34 +37,71 @@ class AudioMetadata:
 
 
 def resolve_ffmpeg_binary(custom_path: Optional[str] = None) -> str:
-    """Resolve o caminho executável do FFmpeg (customizado, local no projeto ou no PATH)."""
+    """Resolve o caminho executável do FFmpeg (customizado, pasta do executável congelado, raiz do projeto ou PATH)."""
     if custom_path and os.path.isfile(custom_path):
         return os.path.abspath(custom_path)
-    
+
+    # 1. Verifica na pasta do executável congelado (PyInstaller)
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).parent
+        frozen_cand = exe_dir / "tools" / "ffmpeg" / "bin" / "ffmpeg.exe"
+        if frozen_cand.is_file():
+            return str(frozen_cand.resolve())
+        if hasattr(sys, "_MEIPASS"):
+            meipass_cand = Path(sys._MEIPASS) / "tools" / "ffmpeg" / "bin" / "ffmpeg.exe"
+            if meipass_cand.is_file():
+                return str(meipass_cand.resolve())
+
+    # 2. Verifica a partir da localização deste arquivo no projeto
+    project_root = Path(__file__).resolve().parent.parent
+    root_cand = project_root / "tools" / "ffmpeg" / "bin" / "ffmpeg.exe"
+    if root_cand.is_file():
+        return str(root_cand.resolve())
+
+    # 3. Verifica no diretório de trabalho atual
+    cwd_cand = Path("tools/ffmpeg/bin/ffmpeg.exe").resolve()
+    if cwd_cand.is_file():
+        return str(cwd_cand.resolve())
+
+    # 4. Verifica no PATH do sistema
     found = shutil.which("ffmpeg")
     if found:
         return found
-        
-    # Verifica em locais conhecidos do projeto
-    candidate = Path("tools/ffmpeg/bin/ffmpeg.exe").resolve()
-    if candidate.is_file():
-        return str(candidate)
 
     return "ffmpeg"
 
 
 def resolve_ffprobe_binary(custom_path: Optional[str] = None) -> str:
-    """Resolve o caminho executável do FFprobe (customizado, local no projeto ou no PATH)."""
+    """Resolve o caminho executável do FFprobe (customizado, pasta do executável congelado, raiz do projeto ou PATH)."""
     if custom_path and os.path.isfile(custom_path):
         return os.path.abspath(custom_path)
-        
+
+    # 1. Verifica na pasta do executável congelado (PyInstaller)
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).parent
+        frozen_cand = exe_dir / "tools" / "ffmpeg" / "bin" / "ffprobe.exe"
+        if frozen_cand.is_file():
+            return str(frozen_cand.resolve())
+        if hasattr(sys, "_MEIPASS"):
+            meipass_cand = Path(sys._MEIPASS) / "tools" / "ffmpeg" / "bin" / "ffprobe.exe"
+            if meipass_cand.is_file():
+                return str(meipass_cand.resolve())
+
+    # 2. Verifica a partir da localização deste arquivo no projeto
+    project_root = Path(__file__).resolve().parent.parent
+    root_cand = project_root / "tools" / "ffmpeg" / "bin" / "ffprobe.exe"
+    if root_cand.is_file():
+        return str(root_cand.resolve())
+
+    # 3. Verifica no diretório de trabalho atual
+    cwd_cand = Path("tools/ffmpeg/bin/ffprobe.exe").resolve()
+    if cwd_cand.is_file():
+        return str(cwd_cand.resolve())
+
+    # 4. Verifica no PATH do sistema
     found = shutil.which("ffprobe")
     if found:
         return found
-        
-    candidate = Path("tools/ffmpeg/bin/ffprobe.exe").resolve()
-    if candidate.is_file():
-        return str(candidate)
 
     return "ffprobe"
 
