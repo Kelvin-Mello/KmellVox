@@ -30,40 +30,40 @@ class TestTranslator(unittest.TestCase):
 
     def test_model_filename_resolution(self):
         """Testa se o Translator seleciona o arquivo GGUF correto com base no ModelProfile."""
-        # Perfil A (8GB+ VRAM -> Qwen2.5-7B-Instruct Q4_K_M)
+        # Perfil A (8GB+ VRAM -> Qwen3-8B-Q4_K_M.gguf)
         prof_a = ModelProfile.from_profile("perfil_a")
         t_a = Translator(model_profile=prof_a, models_dir=self.temp_dir.name)
-        self.assertEqual(t_a.model_filename, "Qwen2.5-7B-Instruct-Q4_K_M.gguf")
-        self.assertIn("Qwen2.5-7B-Instruct-Q4_K_M.gguf", t_a.model_path)
+        self.assertEqual(t_a.model_filename, "Qwen3-8B-Q4_K_M.gguf")
+        self.assertIn("Qwen3-8B-Q4_K_M.gguf", t_a.model_path)
         self.assertEqual(t_a.n_gpu_layers, -1)
-        self.assertEqual(prof_a.translation_repo_id, "bartowski/Qwen2.5-7B-Instruct-GGUF")
-        self.assertEqual(prof_a.translation_model_family, "Qwen2.5")
+        self.assertEqual(prof_a.translation_repo_id, "Qwen/Qwen3-8B-GGUF")
+        self.assertEqual(prof_a.translation_model_family, "Qwen3")
 
-        # Perfil B (5GB-7.5GB VRAM -> Qwen2.5-3B-Instruct Q4_K_M)
+        # Perfil B (5GB-7.5GB VRAM -> Qwen3-4B-Instruct-2507-Q4_K_M.gguf)
         prof_b = ModelProfile.from_profile("perfil_b")
         t_b = Translator(model_profile=prof_b, models_dir=self.temp_dir.name)
-        self.assertEqual(t_b.model_filename, "Qwen2.5-3B-Instruct-Q4_K_M.gguf")
-        self.assertIn("Qwen2.5-3B-Instruct-Q4_K_M.gguf", t_b.model_path)
+        self.assertEqual(t_b.model_filename, "Qwen3-4B-Instruct-2507-Q4_K_M.gguf")
+        self.assertIn("Qwen3-4B-Instruct-2507-Q4_K_M.gguf", t_b.model_path)
         self.assertEqual(t_b.n_gpu_layers, -1)
-        self.assertEqual(prof_b.translation_repo_id, "bartowski/Qwen2.5-3B-Instruct-GGUF")
-        self.assertEqual(prof_b.translation_model_family, "Qwen2.5")
+        self.assertEqual(prof_b.translation_repo_id, "unsloth/Qwen3-4B-Instruct-2507-GGUF")
+        self.assertEqual(prof_b.translation_model_family, "Qwen3")
 
-        # CPU (<5GB VRAM -> Qwen2.5-1.5B-Instruct Q4_K_M)
+        # CPU (<5GB VRAM -> Qwen3-0.6B-Q4_K_M.gguf)
         prof_cpu = ModelProfile.from_profile("cpu")
         t_cpu = Translator(model_profile=prof_cpu, models_dir=self.temp_dir.name)
-        self.assertEqual(t_cpu.model_filename, "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf")
+        self.assertEqual(t_cpu.model_filename, "Qwen3-0.6B-Q4_K_M.gguf")
         self.assertEqual(t_cpu.n_gpu_layers, 0)
-        self.assertEqual(prof_cpu.translation_repo_id, "bartowski/Qwen2.5-1.5B-Instruct-GGUF")
-        self.assertEqual(prof_cpu.translation_model_family, "Qwen2.5")
+        self.assertEqual(prof_cpu.translation_repo_id, "unsloth/Qwen3-0.6B-GGUF")
+        self.assertEqual(prof_cpu.translation_model_family, "Qwen3")
 
     def test_model_family_and_repo_filename_consistency(self):
         """
-        Valida que para todos os perfis (perfil_a, perfil_b, cpu), a família declarada (Qwen2.5)
+        Valida que para todos os perfis (perfil_a, perfil_b, cpu), a família declarada (Qwen3)
         seja estritamente consistente com o repo_id e o filename GGUF.
         """
         for prof_name in ("perfil_a", "perfil_b", "cpu"):
             mp = ModelProfile.from_profile(prof_name)
-            family = mp.translation_model_family.lower()  # "qwen2.5"
+            family = mp.translation_model_family.lower()  # "qwen3"
             repo = mp.translation_repo_id.lower()
             filename = mp.translation_filename.lower()
 
@@ -103,15 +103,15 @@ class TestTranslator(unittest.TestCase):
             f"Inconsistência no config.yaml: model_family='{family}' diverge de filename='{filename}'",
         )
 
-    def test_downloader_model_catalog_qwen(self):
-        """Valida que o catálogo de download possui as especificações corretas de Qwen2.5 para cada perfil."""
+    def test_downloader_model_catalog_qwen3(self):
+        """Valida que o catálogo de download possui as especificações corretas de Qwen3 para cada perfil."""
         llm_specs = [s for s in MODEL_CATALOG if s.category == "translation"]
         self.assertEqual(len(llm_specs), 3)
 
         for spec in llm_specs:
-            self.assertIn("Qwen2.5", spec.name)
-            self.assertIn("Qwen2.5", spec.repo_id)
-            self.assertIn("Qwen2.5", spec.filename)
+            self.assertIn("Qwen3", spec.name)
+            self.assertIn("Qwen3", spec.repo_id)
+            self.assertIn("Qwen3", spec.filename)
 
     def test_system_prompt_requirements(self):
         """Valida que o prompt de sistema contém diretrizes para nomes próprios, tom e sem comentários."""
