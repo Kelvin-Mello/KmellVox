@@ -128,11 +128,11 @@ class Translator:
         if hasattr(self.profile, "translation_filename") and self.profile.translation_filename:
             return self.profile.translation_filename
         if self.profile.profile_name == "perfil_a":
-            return "Qwen3-8B-Instruct-Q4_K_M.gguf"
+            return "Qwen2.5-7B-Instruct-Q4_K_M.gguf"
         elif self.profile.profile_name == "perfil_b":
-            return "Qwen3-4B-Instruct-Q4_K_M.gguf"
+            return "Qwen2.5-3B-Instruct-Q4_K_M.gguf"
         else:
-            return "Qwen3-1.5B-Instruct-Q4_K_M.gguf"
+            return "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf"
 
     def _resolve_model_path(self, explicit_path: Optional[str]) -> Optional[str]:
         """Localiza o arquivo .gguf no disco."""

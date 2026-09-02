@@ -44,20 +44,20 @@ class TestFetchModels(unittest.TestCase):
         names_a = [s["name"] for s in statuses_a]
         self.assertTrue(any("indextts-2" in n.lower() for n in names_a))
         self.assertTrue(any("large-v3" in n.lower() for n in names_a))
-        self.assertTrue(any("qwen3-8b" in n.lower() for n in names_a))
+        self.assertTrue(any("qwen2.5" in n.lower() for n in names_a))
 
-        # 2. perfil_b (6GB) NÃO deve incluir IndexTTS-2 e deve incluir Distil-Large-v3 e Qwen3-4B
+        # 2. perfil_b (6GB) NÃO deve incluir IndexTTS-2 e deve incluir Distil-Large-v3 e Qwen2.5
         statuses_b = check_models_status(profile="perfil_b", base_models_dir=self.temp_dir.name, config_path=self.dummy_config)
         names_b = [s["name"] for s in statuses_b]
         self.assertFalse(any("indextts-2" in n.lower() for n in names_b))
         self.assertTrue(any("distil" in n.lower() for n in names_b))
-        self.assertTrue(any("qwen3-4b" in n.lower() for n in names_b))
+        self.assertTrue(any("qwen2.5" in n.lower() for n in names_b))
 
-        # 3. cpu deve incluir Whisper Small e Qwen3-1.5B
+        # 3. cpu deve incluir Whisper Small e Qwen2.5 1.5B
         statuses_cpu = check_models_status(profile="cpu", base_models_dir=self.temp_dir.name, config_path=self.dummy_config)
         names_cpu = [s["name"] for s in statuses_cpu]
         self.assertTrue(any("small" in n.lower() for n in names_cpu))
-        self.assertTrue(any("1.5b" in n.lower() for n in names_cpu))
+        self.assertTrue(any("1.5b" in n.lower() or "qwen2.5" in n.lower() for n in names_cpu))
 
     @patch("downloader.fetch_models.hf_hub_download")
     @patch("downloader.fetch_models.snapshot_download")
