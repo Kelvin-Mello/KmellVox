@@ -20,12 +20,17 @@ from core.safe_streams import SafeStream, ensure_safe_streams
 ensure_safe_streams()
 
 import yaml
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from tqdm import tqdm
 
 from core.hardware import ModelProfile, detect_gpu_profile, sync_hardware_config
 
 logger = logging.getLogger("KmellVox.Downloader")
+
+
+class ModelSpecVerificationError(RuntimeError):
+    """Exceção levantada quando um repo_id ou filename configurado no Hugging Face não existe ou é inacessível."""
+    pass
 
 
 class SafeTqdm(tqdm):
@@ -301,12 +306,81 @@ def update_config_model_paths(
         logger.error("Erro ao gravar modelos no config.yaml: %s", e)
 
 
+def verify_spec_on_huggingface(
+    spec: ModelDownloadSpec,
+    hf_api: Optional[HfApi] = None,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Verifica se o repositório (repo_id) e o arquivo específico (filename) existem no Hugging Face
+    antes de qualquer download ser iniciado.
+
+    Se o repositório ou o arquivo não existirem:
+    1. NÃO altera automaticamente a família ou arquitetura do modelo.
+    2. Retorna um erro detalhado identificando exatamente o que falhou e sugerindo possíveis arquivos/nomes
+       disponíveis no repositório.
+    """
+    if hf_api is None:
+        hf_api = HfApi()
+
+    try:
+        info = hf_api.model_info(repo_id=spec.repo_id)
+    except Exception as exc:
+        err_msg = (
+            f"Repositório Hugging Face inexistente ou inacessível: '{spec.repo_id}' (Modelo: '{spec.name}').\n"
+            f"   Detalhes do erro: {type(exc).__name__}: {exc}\n"
+            f"   Diagnóstico: Verifique se o repo_id foi digitado corretamente na organização oficial "
+            f"(ex: 'Qwen/Qwen3-8B-GGUF' sem '-Instruct' no repositório) ou em mantenedores como 'unsloth/' ou 'bartowski/'. "
+            f"Atenção para presença/ausência de prefixos e sufixos no nome do repositório."
+        )
+        return False, err_msg
+
+    if spec.filename:
+        siblings = [s.rfilename for s in (info.siblings or [])]
+        if spec.filename not in siblings:
+            # Busca candidatos semelhantes no repositório
+            cand_stem = Path(spec.filename).stem.lower().replace("-instruct", "").replace("_", "-")
+            similar = [
+                s for s in siblings
+                if s.endswith(".gguf") or s.endswith(".bin") or s.endswith(".safetensors") or cand_stem in s.lower()
+            ]
+            suggestions_str = ", ".join(f"'{s}'" for s in similar[:8]) if similar else "nenhum arquivo similar encontrado"
+            err_msg = (
+                f"Arquivo de modelo não encontrado: '{spec.filename}' no repositório '{spec.repo_id}' (Modelo: '{spec.name}').\n"
+                f"   Arquivos disponíveis semelhantes no repositório: {suggestions_str}.\n"
+                f"   Diagnóstico: O repositório '{spec.repo_id}' existe, mas o arquivo exato '{spec.filename}' não foi encontrado. "
+                f"Verifique se o modelo dispensa o sufixo '-Instruct', se possui prefixo próprio ou convenção de quantização diferente."
+            )
+            return False, err_msg
+
+    return True, None
+
+
+def verify_model_catalog_online(
+    specs: List[ModelDownloadSpec],
+    hf_api: Optional[HfApi] = None,
+) -> List[str]:
+    """
+    Executa a pré-verificação online para uma lista de especificações do MODEL_CATALOG.
+    Retorna a lista de mensagens de erro encontradas (vazia se todos existirem).
+    """
+    if hf_api is None:
+        hf_api = HfApi()
+
+    errors: List[str] = []
+    for spec in specs:
+        ok, err = verify_spec_on_huggingface(spec, hf_api=hf_api)
+        if not ok and err:
+            errors.append(err)
+    return errors
+
+
 def fetch_models_for_profile(
     profile: Optional[str] = None,
     base_models_dir: str = "models",
     config_path: str = "config.yaml",
     force_download: bool = False,
     progress_callback: Optional[Callable[[float, str], None]] = None,
+    verify_online_first: bool = True,
 ) -> Dict[str, str]:
     """
     Baixa apenas os arquivos e checkpoints necessários para o perfil de hardware detectado/selecionado,
@@ -328,6 +402,33 @@ def fetch_models_for_profile(
     logger.info("KmellVox Downloader - Perfil: '%s' (%d modelos)", profile, total_specs)
     logger.info("Diretório de destino: %s", base)
     logger.info("=================================================================")
+
+    # 0. Pré-verificação online de existência no Hugging Face antes de qualquer download real
+    if verify_online_first:
+        specs_to_verify = []
+        for spec in target_specs:
+            dest_target = base / spec.destination_rel
+            # Se não está forçando download e já existe localmente com tamanho mínimo válido, não precisa checar rede
+            if not force_download and verify_file_or_dir_exists(dest_target, spec.expected_min_bytes):
+                continue
+            specs_to_verify.append(spec)
+
+        if specs_to_verify:
+            logger.info("Executando pré-verificação online no Hugging Face para %d modelo(s)...", len(specs_to_verify))
+            if progress_callback:
+                progress_callback(0.01, f"Pré-verificando existência online de {len(specs_to_verify)} modelo(s)...")
+
+            validation_errors = verify_model_catalog_online(specs_to_verify)
+            if validation_errors:
+                full_err_msg = (
+                    "Falha na pré-verificação de modelos no Hugging Face:\n\n"
+                    + "\n\n".join(f"• {e}" for e in validation_errors)
+                    + "\n\n[AVISO DE INTEGRIDADE DE ARQUITETURA]\n"
+                    "Nenhuma alteração automática de arquitetura ou família de modelo foi aplicada. "
+                    "Por favor, ajuste o nome do arquivo ou repositório no código/configuração conforme o diagnóstico acima."
+                )
+                logger.error(full_err_msg)
+                raise ModelSpecVerificationError(full_err_msg)
 
     if progress_callback:
         progress_callback(0.02, f"Iniciando download para perfil '{profile}' ({total_specs} modelos)...")

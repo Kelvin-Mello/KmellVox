@@ -16,11 +16,15 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from core.safe_streams import SafeStream, ensure_safe_streams
 from downloader.fetch_models import (
     MODEL_CATALOG,
+    ModelDownloadSpec,
+    ModelSpecVerificationError,
     SafeTqdm,
     check_models_status,
     fetch_models_for_profile,
     update_config_model_paths,
     verify_file_or_dir_exists,
+    verify_model_catalog_online,
+    verify_spec_on_huggingface,
 )
 
 
@@ -130,12 +134,99 @@ class TestFetchModels(unittest.TestCase):
     def test_resume_and_verification_skips_existing(self):
         """Testa se arquivos já existentes no disco não são baixados novamente."""
         # Cria arquivo fictício para simular modelo já baixado
-        mock_model_file = Path(self.temp_dir.name) / "llm" / "Qwen3-4B-Instruct-Q4_K_M.gguf"
+        mock_model_file = Path(self.temp_dir.name) / "llm" / "Qwen3-8B-Q4_K_M.gguf"
         mock_model_file.parent.mkdir(parents=True, exist_ok=True)
         with open(mock_model_file, "wb") as f:
             f.write(b"0" * 4096)
 
         self.assertTrue(verify_file_or_dir_exists(mock_model_file, min_bytes=1024))
+
+    def test_pre_flight_verification_valid_spec(self):
+        """Testa que uma especificação válida com repositório e arquivo existentes passa na pré-verificação."""
+        mock_api = MagicMock()
+        mock_info = MagicMock()
+        mock_sibling1 = MagicMock(rfilename="Qwen3-8B-Q4_K_M.gguf")
+        mock_sibling2 = MagicMock(rfilename="README.md")
+        mock_info.siblings = [mock_sibling1, mock_sibling2]
+        mock_api.model_info.return_value = mock_info
+
+        spec = ModelDownloadSpec(
+            key="llm_qwen3_8b",
+            name="Qwen3-8B GGUF Q4_K_M",
+            category="translation",
+            repo_id="Qwen/Qwen3-8B-GGUF",
+            filename="Qwen3-8B-Q4_K_M.gguf",
+            profiles=["perfil_a"],
+        )
+
+        ok, err = verify_spec_on_huggingface(spec, hf_api=mock_api)
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+
+    def test_pre_flight_verification_invalid_repo(self):
+        """Testa que um repositório inexistente é rejeitado com mensagem clara e não altera o modelo."""
+        mock_api = MagicMock()
+        mock_api.model_info.side_effect = Exception("401 Client Error: Repository Not Found")
+
+        spec = ModelDownloadSpec(
+            key="llm_invalid",
+            name="Modelo Inexistente",
+            category="translation",
+            repo_id="OrganizaçãoInexistente/Modelo-Fantasma",
+            filename="modelo.gguf",
+            profiles=["perfil_a"],
+        )
+
+        ok, err = verify_spec_on_huggingface(spec, hf_api=mock_api)
+        self.assertFalse(ok)
+        self.assertIsNotNone(err)
+        self.assertIn("OrganizaçãoInexistente/Modelo-Fantasma", err)
+        self.assertIn("Repositório Hugging Face inexistente", err)
+
+    def test_pre_flight_verification_missing_filename_suggests_alternatives(self):
+        """Testa que um filename inexistente é rejeitado, lista alternativas e diagnostica sufixos sem trocar arquitetura."""
+        mock_api = MagicMock()
+        mock_info = MagicMock()
+        mock_sibling1 = MagicMock(rfilename="Qwen3-8B-Q4_K_M.gguf")
+        mock_sibling2 = MagicMock(rfilename="Qwen3-8B-Q5_K_M.gguf")
+        mock_info.siblings = [mock_sibling1, mock_sibling2]
+        mock_api.model_info.return_value = mock_info
+
+        # Tenta pedir 'Qwen3-8B-Instruct-Q4_K_M.gguf' que não existe no repo
+        spec = ModelDownloadSpec(
+            key="llm_qwen3_8b",
+            name="Qwen3-8B GGUF",
+            category="translation",
+            repo_id="Qwen/Qwen3-8B-GGUF",
+            filename="Qwen3-8B-Instruct-Q4_K_M.gguf",
+            profiles=["perfil_a"],
+        )
+
+        ok, err = verify_spec_on_huggingface(spec, hf_api=mock_api)
+        self.assertFalse(ok)
+        self.assertIsNotNone(err)
+        self.assertIn("Qwen3-8B-Instruct-Q4_K_M.gguf", err)
+        self.assertIn("Qwen3-8B-Q4_K_M.gguf", err)  # Sugestão encontrada
+        self.assertIn("Diagnóstico", err)
+
+    @patch("downloader.fetch_models.verify_model_catalog_online")
+    def test_fetch_models_aborts_on_pre_flight_failure(self, mock_verify_online):
+        """Testa que o processo de download é abortado imediatamente com ModelSpecVerificationError em caso de falha."""
+        mock_verify_online.return_value = [
+            "Repositório inexistente: Qwen/Qwen3-8B-Instruct-GGUF. Sugestão: use Qwen/Qwen3-8B-GGUF"
+        ]
+
+        with self.assertRaises(ModelSpecVerificationError) as ctx:
+            fetch_models_for_profile(
+                profile="perfil_a",
+                base_models_dir=self.temp_dir.name,
+                config_path=self.dummy_config,
+                force_download=True,
+                verify_online_first=True,
+            )
+
+        self.assertIn("Falha na pré-verificação de modelos no Hugging Face", str(ctx.exception))
+        self.assertIn("AVISO DE INTEGRIDADE DE ARQUITETURA", str(ctx.exception))
 
 
 if __name__ == "__main__":
