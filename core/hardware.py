@@ -1,4 +1,10 @@
-"""Módulo de detecção de hardware, VRAM e seleção automática de perfil de execução para o KmellVox."""
+"""Módulo de detecção de hardware, VRAM e seleção automática de perfil de execução para o KmellVox.
+
+Contém a ÚNICA fonte de verdade para resolução de perfis de hardware a partir de VRAM:
+- VRAM >= 7.5 GB         -> perfil_a (float16, Whisper large-v3, Qwen3-8B, IndexTTS-2 habilitado)
+- 5.0 GB <= VRAM < 7.5 GB -> perfil_b (int8_float16, Whisper distil-large-v3, Qwen3-4B, MuseTalk FP16)
+- Sem GPU CUDA / < 5.0 GB -> cpu (int8, Whisper small, Qwen3-1.5B)
+"""
 
 from __future__ import annotations
 
@@ -9,7 +15,7 @@ import shutil
 import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import yaml
 
@@ -21,11 +27,6 @@ class HardwareProfile(str, enum.Enum):
     PERFIL_A = "perfil_a"      # VRAM >= 7.5 GB
     PERFIL_B = "perfil_b"      # 5.0 GB <= VRAM < 7.5 GB
     CPU = "cpu"                # Sem GPU CUDA ou VRAM < 5.0 GB
-    
-    # Aliases legados para compatibilidade
-    LOW_VRAM = "perfil_b"
-    MID_VRAM = "perfil_a"
-    HIGH_VRAM = "perfil_a"
 
 
 @dataclass
@@ -35,7 +36,7 @@ class ModelProfile:
     
     Campos:
         profile_name: Nome do perfil ("perfil_a", "perfil_b", "cpu").
-        whisper_variant: Variante do faster-whisper (large-v3, distil-large-v3, etc.).
+        whisper_variant: Variante do faster-whisper (large-v3, distil-large-v3, small).
         whisper_compute_type: Tipo de computação (float16, int8_float16, int8).
         translation_model: Nome/identificador do modelo LLM para tradução.
         default_tts_engine: Engine padrão de síntese de voz (F5-TTS).
@@ -84,10 +85,10 @@ class ModelProfile:
                 whisper_compute_type="int8_float16",
                 translation_model="Qwen3-4B-Instruct Q4_K_M",
                 default_tts_engine="F5-TTS",
-                enable_indextts_2=False,     # Apenas perfil_a
+                enable_indextts_2=False,     # Apenas perfil_a (8GB+)
                 musetalk_use_float16=True,   # Obrigatório em perfil_b
             )
-        else:  # CPU mode
+        else:  # Modo CPU
             return cls(
                 profile_name="cpu",
                 whisper_variant="small",
@@ -103,38 +104,134 @@ class ModelProfile:
         return asdict(self)
 
 
-def _save_gpu_profile_to_config(profile: str, config_path: str = "config.yaml") -> None:
-    """Salva a chave gpu_profile no arquivo config.yaml."""
-    path = Path(config_path)
-    data: Dict[str, Any] = {}
+def resolve_profile_from_vram(cuda_available: bool, vram_gb: float) -> str:
+    """
+    ÚNICA fonte de verdade para a lógica de decisão do perfil de hardware a partir da VRAM.
     
+    Regras estritas do KmellVox:
+        - VRAM >= 7.5 GB         -> "perfil_a"
+        - 5.0 GB <= VRAM < 7.5 GB -> "perfil_b"
+        - Sem GPU CUDA / VRAM < 5.0 GB -> "cpu"
+    """
+    if not cuda_available:
+        return "cpu"
+
+    if vram_gb >= 7.5:
+        return "perfil_a"
+    elif vram_gb >= 5.0:
+        return "perfil_b"
+    else:
+        return "cpu"
+
+
+def query_physical_gpu() -> Tuple[bool, str, float]:
+    """
+    Consulta diretamente os recursos da GPU física instalada na máquina.
+    
+    Returns:
+        Tuple[bool, str, float]: (cuda_disponível, nome_do_dispositivo, vram_total_gb)
+    """
+    # 1. Tenta usar torch.cuda.get_device_properties(0).total_memory
+    try:
+        import torch
+        if hasattr(torch, "cuda"):
+            if torch.cuda.is_available():
+                device_name = torch.cuda.get_device_name(0)
+                total_bytes = torch.cuda.get_device_properties(0).total_memory
+                vram_gb = total_bytes / (1024 ** 3)
+                logger.debug("PyTorch CUDA detectado: %s (VRAM: %.2f GB)", device_name, vram_gb)
+                return True, device_name, vram_gb
+            else:
+                # PyTorch está presente mas não possui suporte CUDA ativo
+                return False, "CPU", 0.0
+    except ImportError:
+        logger.debug("PyTorch não encontrado no ambiente.")
+    except Exception as e:
+        logger.debug("Falha ao consultar torch.cuda: %s", e)
+
+    # 2. Fallback via nvidia-smi se torch não estiver presente
+    gpu_data = _query_nvidia_smi()
+    if gpu_data:
+        cuda_available = True
+        device_name = gpu_data.get("name", "NVIDIA GPU")
+        vram_gb = gpu_data.get("total_gb", 0.0)
+        return cuda_available, device_name, vram_gb
+
+    return False, "CPU", 0.0
+
+
+def sync_hardware_config(
+    profile: str,
+    device_name: str = "CPU",
+    cuda_available: bool = False,
+    vram_gb: float = 0.0,
+    config_path: str = "config.yaml",
+) -> Dict[str, Any]:
+    """
+    ÚNICA função responsável por persistir e sincronizar todas as chaves de hardware no config.yaml.
+    
+    Garante que:
+        - A chave raiz 'gpu_profile' seja exatamente igual a 'hardware.profile'.
+        - 'hardware.compute_type' seja consistente com o ModelProfile correspondente.
+        - 'hardware.vram_detected_gb' e 'hardware.device' reflitam o hardware real.
+    """
+    path = Path(config_path).resolve()
+    data: Dict[str, Any] = {}
+
     if path.is_file():
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
         except Exception as e:
-            logger.debug("Erro ao ler %s para salvar gpu_profile: %s", path, e)
+            logger.debug("Erro ao ler %s para sincronizar hardware: %s", path, e)
 
-    data["gpu_profile"] = profile
+    norm_profile = profile.lower().strip()
+    if norm_profile not in ("perfil_a", "perfil_b", "cpu"):
+        norm_profile = "perfil_a" if norm_profile in ("high_vram", "mid_vram") else "perfil_b" if norm_profile == "low_vram" else "cpu"
+
+    model_prof = ModelProfile.from_profile(norm_profile)
+
+    # Atualiza chave raiz
+    data["gpu_profile"] = norm_profile
+
+    # Atualiza seção aninhada 'hardware'
+    if "hardware" not in data or not isinstance(data["hardware"], dict):
+        data["hardware"] = {}
+
+    data["hardware"]["profile"] = norm_profile
+    data["hardware"]["compute_type"] = model_prof.whisper_compute_type
+    data["hardware"]["device"] = "cuda" if cuda_available and norm_profile != "cpu" else "cpu"
+    data["hardware"]["device_name"] = device_name
+    data["hardware"]["vram_detected_gb"] = round(vram_gb, 2)
 
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             yaml.dump(data, f, allow_unicode=True, default_flow_style=False)
-        logger.info("Perfil de GPU '%s' persistido com sucesso em '%s'.", profile, path)
+        logger.info(
+            "Configuração de hardware sincronizada em '%s': gpu_profile='%s', hardware.profile='%s', compute_type='%s', vram=%.2f GB",
+            path.name, norm_profile, norm_profile, model_prof.whisper_compute_type, vram_gb
+        )
     except Exception as e:
-        logger.warning("Não foi possível salvar gpu_profile em '%s': %s", path, e)
+        logger.warning("Não foi possível salvar configurações em '%s': %s", path, e)
+
+    return data
 
 
 def _load_gpu_profile_from_config(config_path: str = "config.yaml") -> Optional[str]:
-    """Tenta carregar o perfil de GPU previamente salvo no config.yaml."""
-    path = Path(config_path)
+    """Tenta carregar e validar o perfil de GPU previamente salvo no config.yaml."""
+    path = Path(config_path).resolve()
     if path.is_file():
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
-                profile = data.get("gpu_profile")
-                if profile in ("perfil_a", "perfil_b", "cpu"):
-                    return profile
+                root_profile = data.get("gpu_profile")
+                nested_profile = data.get("hardware", {}).get("profile")
+
+                # Se ambas as chaves existirem e forem consistentes
+                if root_profile in ("perfil_a", "perfil_b", "cpu"):
+                    if nested_profile is None or nested_profile == root_profile:
+                        return root_profile
         except Exception as e:
             logger.debug("Erro ao ler gpu_profile de %s: %s", path, e)
     return None
@@ -144,75 +241,65 @@ def detect_gpu_profile(config_path: str = "config.yaml", force_redetect: bool = 
     """
     Detecta o perfil de hardware baseado na VRAM da GPU via PyTorch CUDA.
     
-    Critérios:
+    Critérios estritos:
         - VRAM >= 7.5 GB: "perfil_a"
         - 5.0 GB <= VRAM < 7.5 GB: "perfil_b"
         - Sem GPU CUDA / VRAM < 5.0 GB: "cpu" (com aviso claro de lentidão)
         
-    Salva o resultado na chave 'gpu_profile' de config.yaml.
-    
-    Args:
-        config_path: Caminho do arquivo de configuração config.yaml.
-        force_redetect: Se True, ignora o valor salvo em config.yaml e redetecta.
-        
-    Returns:
-        str: "perfil_a", "perfil_b" ou "cpu".
+    Salva e sincroniza o resultado em config.yaml (raiz e chaves aninhadas).
     """
+    # 1. Consulta o hardware físico real
+    cuda_available, device_name, vram_gb = query_physical_gpu()
+    physical_profile = resolve_profile_from_vram(cuda_available, vram_gb)
+
     if not force_redetect:
         saved_profile = _load_gpu_profile_from_config(config_path)
+        # Se houver perfil salvo, valida se coincide com o hardware físico atual
         if saved_profile is not None:
-            logger.debug("Utilizando perfil de GPU salvo no config: %s", saved_profile)
-            return saved_profile
+            # Se o hardware físico for CUDA e tiver capacidade para perfil_a/perfil_b,
+            # mas o config tiver salvo "cpu" ou perfil divergente, força ressincronização!
+            if saved_profile == physical_profile:
+                logger.debug("Perfil de GPU verificado e compatível com o config: %s", saved_profile)
+                return saved_profile
+            else:
+                logger.warning(
+                    "Divergência detectada entre o hardware atual (%s, %.2f GB -> %s) e o perfil salvo (%s). Ressincronizando config.yaml...",
+                    device_name, vram_gb, physical_profile, saved_profile
+                )
 
-    # 1. Tenta usar torch.cuda.get_device_properties(0).total_memory
-    cuda_available = False
-    vram_gb = 0.0
-    device_name = "CPU"
-
-    try:
-        import torch
-        if torch.cuda.is_available():
-            cuda_available = True
-            device_name = torch.cuda.get_device_name(0)
-            total_bytes = torch.cuda.get_device_properties(0).total_memory
-            vram_gb = total_bytes / (1024 ** 3)
-            logger.info("PyTorch CUDA detectado: %s (VRAM Total: %.2f GB)", device_name, vram_gb)
-    except ImportError:
-        logger.debug("PyTorch não está instalado no ambiente.")
-    except Exception as e:
-        logger.warning("Falha ao consultar torch.cuda: %s", e)
-
-    # 2. Avaliação do perfil
+    # 2. Avaliação e logs claros ao usuário
     if not cuda_available:
         logger.warning(
             "⚠️ AVISO: Nenhuma GPU CUDA compatível foi detectada! "
             "O KmellVox será executado no modo CPU. O processamento de áudio, tradução "
             "e lip sync será MUITO mais lento que o habitual."
         )
-        profile = "cpu"
-    elif vram_gb >= 7.5:
+    elif physical_profile == "perfil_a":
         logger.info("VRAM Total (%.2f GB) >= 7.5 GB -> Selecionado: perfil_a", vram_gb)
-        profile = "perfil_a"
-    elif vram_gb >= 5.0:
+    elif physical_profile == "perfil_b":
         logger.info("VRAM Total (%.2f GB) entre 5.0 GB e 7.5 GB -> Selecionado: perfil_b", vram_gb)
-        profile = "perfil_b"
     else:
         logger.warning(
             "⚠️ AVISO: A GPU detectada possui apenas %.2f GB de VRAM (mínimo recomendado: 5.0 GB). "
             "Executando no modo CPU para evitar erros de falta de memória (Out-Of-Memory). "
             "O processamento será consideravelmente mais lento.", vram_gb
         )
-        profile = "cpu"
 
-    # 3. Salva em config.yaml
-    _save_gpu_profile_to_config(profile, config_path)
+    # 3. Salva e sincroniza todas as chaves no config.yaml
+    sync_hardware_config(
+        profile=physical_profile,
+        device_name=device_name,
+        cuda_available=cuda_available,
+        vram_gb=vram_gb,
+        config_path=config_path,
+    )
 
-    return profile
+    return physical_profile
 
 
 @dataclass
 class HardwareInfo:
-    """Informações detalhadas do ambiente de hardware detectado (compatibilidade retroativa)."""
+    """Informações detalhadas do ambiente de hardware detectado."""
     device_name: str = "CPU"
     cuda_available: bool = False
     vram_total_gb: float = 0.0
@@ -289,39 +376,33 @@ def _query_nvidia_smi() -> Optional[Dict[str, Any]]:
 
 def detect_hardware(force_profile: Optional[str] = None, config_path: str = "config.yaml") -> HardwareInfo:
     """
-    Detecta os recursos do sistema e seleciona o perfil de hardware e de modelos.
+    Detecta os recursos do sistema, valida e seleciona o perfil de hardware e de modelos.
     """
     info = HardwareInfo()
     info.system_ram_gb = _get_ram_info()
 
-    gpu_prof = detect_gpu_profile(config_path=config_path, force_redetect=(force_profile is not None))
+    cuda_avail, dev_name, vram_total = query_physical_gpu()
+    info.cuda_available = cuda_avail
+    info.device_name = dev_name
+    info.vram_total_gb = vram_total
+    info.vram_free_gb = vram_total
+
     if force_profile and force_profile.lower() in ("perfil_a", "perfil_b", "cpu"):
         gpu_prof = force_profile.lower()
+        sync_hardware_config(
+            profile=gpu_prof,
+            device_name=dev_name,
+            cuda_available=cuda_avail,
+            vram_gb=vram_total,
+            config_path=config_path,
+        )
+    else:
+        gpu_prof = detect_gpu_profile(config_path=config_path, force_redetect=False)
 
     info.gpu_profile = gpu_prof
     info.model_profile = ModelProfile.from_profile(gpu_prof, config_path=config_path)
 
-    # Tenta obter dados detalhados para exibição
-    gpu_data = _query_nvidia_smi()
-    try:
-        import torch
-        if torch.cuda.is_available():
-            info.cuda_available = True
-            info.device_name = torch.cuda.get_device_name(0)
-            total_bytes = torch.cuda.get_device_properties(0).total_memory
-            info.vram_total_gb = total_bytes / (1024 ** 3)
-            info.vram_free_gb = info.vram_total_gb
-    except Exception:
-        pass
-
-    if not info.cuda_available and gpu_data:
-        info.cuda_available = True
-        info.device_name = gpu_data.get("name", "NVIDIA GPU")
-        info.vram_total_gb = gpu_data.get("total_gb", 0.0)
-        info.vram_free_gb = gpu_data.get("free_gb", info.vram_total_gb)
-        info.extra_details = gpu_data
-
-    # Mapeia HardwareProfile
+    # Mapeia HardwareProfile enum
     if gpu_prof == "perfil_a":
         info.profile = HardwareProfile.PERFIL_A
     elif gpu_prof == "perfil_b":

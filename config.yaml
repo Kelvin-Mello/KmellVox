@@ -2,12 +2,12 @@ app:
   description: Pipeline Inteligente de Dublagem, Clonagem de Voz e Lip Sync
   name: KmellVox
   version: 1.0.0
-gpu_profile: cpu
+gpu_profile: perfil_a
 hardware:
   compute_type: float16
   device: cuda
   device_name: NVIDIA GeForce RTX 5060 Laptop GPU
-  profile: mid_vram
+  profile: perfil_a
   vram_detected_gb: 7.96
 language:
   default_source_language: auto
@@ -37,7 +37,7 @@ models:
     face_detect_confidence: 0.85
   transcription:
     beam_size: 5
-    model_size: medium
+    model_size: large-v3
     provider: faster-whisper
     vad_filter: true
     vad_min_silence_duration_ms: 500

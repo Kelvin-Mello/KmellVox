@@ -25,7 +25,7 @@ import yaml
 from huggingface_hub import hf_hub_download, snapshot_download
 from tqdm import tqdm
 
-from core.hardware import ModelProfile, detect_gpu_profile
+from core.hardware import ModelProfile, detect_gpu_profile, sync_hardware_config
 
 logger = logging.getLogger("KmellVox.Downloader")
 
@@ -230,17 +230,27 @@ def update_config_model_paths(
         except Exception as e:
             logger.error("Erro ao ler config.yaml: %s", e)
 
-    if "models" not in cfg_data:
-        cfg_data["models"] = {}
+    # Sincroniza hardware e perfis
+    sync_hardware_config(
+        profile=detected_profile,
+        config_path=config_path,
+    )
 
-    for cat, local_path in saved_paths.items():
-        if cat not in cfg_data["models"]:
-            cfg_data["models"][cat] = {}
-        cfg_data["models"][cat]["model_path"] = local_path
-
-    cfg_data["gpu_profile"] = detected_profile
-
+    # Re-lê para incluir caminhos de modelos sem perder chaves de hardware
     try:
+        with open(cfg_file, "r", encoding="utf-8") as f:
+            cfg_data = yaml.safe_load(f) or {}
+
+        if "models" not in cfg_data:
+            cfg_data["models"] = {}
+
+        for cat, local_path in saved_paths.items():
+            if cat not in cfg_data["models"]:
+                cfg_data["models"][cat] = {}
+            cfg_data["models"][cat]["model_path"] = local_path
+
+        cfg_data["gpu_profile"] = detected_profile
+
         with open(cfg_file, "w", encoding="utf-8") as f:
             yaml.dump(cfg_data, f, allow_unicode=True, default_flow_style=False)
         logger.info("Caminhos finais dos modelos gravados com sucesso em: %s", cfg_file)

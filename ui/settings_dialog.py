@@ -279,11 +279,19 @@ class SettingsDialog(QDialog):
 
     def _apply_and_close(self) -> None:
         selected_prof = self.cb_profile.currentText()
-        self.config_data["gpu_profile"] = selected_prof
+        if selected_prof == "auto":
+            selected_prof = detect_gpu_profile(config_path=str(self.config_path), force_redetect=True)
+
+        hw_info = detect_hardware(force_profile=selected_prof, config_path=str(self.config_path))
+        self.config_data["gpu_profile"] = hw_info.gpu_profile
 
         if "hardware" not in self.config_data:
             self.config_data["hardware"] = {}
-        self.config_data["hardware"]["profile"] = selected_prof
+        self.config_data["hardware"]["profile"] = hw_info.gpu_profile
+        self.config_data["hardware"]["compute_type"] = hw_info.recommended_compute_type
+        self.config_data["hardware"]["device"] = "cuda" if hw_info.cuda_available and hw_info.gpu_profile != "cpu" else "cpu"
+        self.config_data["hardware"]["device_name"] = hw_info.device_name
+        self.config_data["hardware"]["vram_detected_gb"] = round(hw_info.vram_total_gb, 2)
 
         if "paths" not in self.config_data:
             self.config_data["paths"] = {}
