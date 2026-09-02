@@ -1,4 +1,4 @@
-"""Testes unitários para core/translate.py (Translator, batching, ModelProfile, VRAM cleanup)."""
+"""Testes unitários para core/translate.py (Translator, batching, ModelProfile, VRAM cleanup e integridade Qwen3)."""
 
 import os
 import sys
@@ -7,12 +7,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import yaml
+
 # Garante que a raiz do projeto esteja no sys.path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.hardware import ModelProfile
 from core.transcribe import TranscriptionSegment
 from core.translate import SYSTEM_PROMPT_TRANSLATION, TranslatedSegment, TranslationResult, Translator
+from downloader.fetch_models import MODEL_CATALOG
 
 
 class TestTranslator(unittest.TestCase):
@@ -26,25 +30,95 @@ class TestTranslator(unittest.TestCase):
 
     def test_model_filename_resolution(self):
         """Testa se o Translator seleciona o arquivo GGUF correto com base no ModelProfile."""
-        # Perfil A
+        # Perfil A (8GB+ VRAM -> Qwen3-8B-Instruct Q4_K_M)
         prof_a = ModelProfile.from_profile("perfil_a")
         t_a = Translator(model_profile=prof_a, models_dir=self.temp_dir.name)
         self.assertEqual(t_a.model_filename, "Qwen3-8B-Instruct-Q4_K_M.gguf")
         self.assertIn("Qwen3-8B-Instruct-Q4_K_M.gguf", t_a.model_path)
         self.assertEqual(t_a.n_gpu_layers, -1)
+        self.assertEqual(prof_a.translation_repo_id, "Qwen/Qwen3-8B-Instruct-GGUF")
+        self.assertEqual(prof_a.translation_model_family, "Qwen3")
 
-        # Perfil B
+        # Perfil B (5GB-7.5GB VRAM -> Qwen3-4B-Instruct Q4_K_M)
         prof_b = ModelProfile.from_profile("perfil_b")
         t_b = Translator(model_profile=prof_b, models_dir=self.temp_dir.name)
         self.assertEqual(t_b.model_filename, "Qwen3-4B-Instruct-Q4_K_M.gguf")
         self.assertIn("Qwen3-4B-Instruct-Q4_K_M.gguf", t_b.model_path)
         self.assertEqual(t_b.n_gpu_layers, -1)
+        self.assertEqual(prof_b.translation_repo_id, "Qwen/Qwen3-4B-Instruct-GGUF")
+        self.assertEqual(prof_b.translation_model_family, "Qwen3")
 
-        # CPU
+        # CPU (<5GB VRAM -> Qwen3-1.5B-Instruct Q4_K_M)
         prof_cpu = ModelProfile.from_profile("cpu")
         t_cpu = Translator(model_profile=prof_cpu, models_dir=self.temp_dir.name)
         self.assertEqual(t_cpu.model_filename, "Qwen3-1.5B-Instruct-Q4_K_M.gguf")
         self.assertEqual(t_cpu.n_gpu_layers, 0)
+        self.assertEqual(prof_cpu.translation_repo_id, "Qwen/Qwen3-1.5B-Instruct-GGUF")
+        self.assertEqual(prof_cpu.translation_model_family, "Qwen3")
+
+    def test_model_family_and_repo_filename_consistency(self):
+        """
+        Valida que para todos os perfis (perfil_a, perfil_b, cpu), a família declarada (Qwen3)
+        seja estritamente consistente com o repo_id e o filename GGUF, sem referências a Qwen2.5.
+        """
+        for prof_name in ("perfil_a", "perfil_b", "cpu"):
+            mp = ModelProfile.from_profile(prof_name)
+            family = mp.translation_model_family.lower()  # "qwen3"
+            repo = mp.translation_repo_id.lower()
+            filename = mp.translation_filename.lower()
+
+            # Valida que o nome da família está presente no repo e no filename
+            self.assertIn(family, repo, f"Família '{family}' não encontrada no repo_id '{repo}' para {prof_name}")
+            self.assertIn(family, filename, f"Família '{family}' não encontrada no filename '{filename}' para {prof_name}")
+
+            # Garante que não há resquícios de Qwen2.5
+            self.assertNotIn("qwen2.5", repo)
+            self.assertNotIn("qwen2.5", filename)
+            self.assertNotIn("qwen2", repo)
+
+    def test_config_yaml_model_family_integrity(self):
+        """
+        Lê o config.yaml do repositório e valida se model_family bate com repo_id e filename.
+        Falha caso haja divergência de versões (ex: model_family=Qwen3 com repo_id=Qwen2.5).
+        """
+        cfg_path = PROJECT_ROOT / "config.yaml"
+        self.assertTrue(cfg_path.is_file(), "config.yaml deve existir na raiz do projeto.")
+
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+
+        trans_cfg = cfg.get("models", {}).get("translation", {})
+        family = trans_cfg.get("model_family", "")
+        repo_id = trans_cfg.get("repo_id", "")
+        filename = trans_cfg.get("filename", "")
+
+        self.assertTrue(family, "model_family deve estar definido em models.translation.")
+        self.assertTrue(repo_id, "repo_id deve estar definido em models.translation.")
+        self.assertTrue(filename, "filename deve estar definido em models.translation.")
+
+        # Validação estrita de compatibilidade
+        self.assertIn(
+            family.lower(),
+            repo_id.lower(),
+            f"Inconsistência no config.yaml: model_family='{family}' diverge de repo_id='{repo_id}'",
+        )
+        self.assertIn(
+            family.lower(),
+            filename.lower(),
+            f"Inconsistência no config.yaml: model_family='{family}' diverge de filename='{filename}'",
+        )
+
+    def test_downloader_model_catalog_qwen3(self):
+        """Valida que o catálogo de download possui as especificações corretas de Qwen3 para cada perfil."""
+        llm_specs = [s for s in MODEL_CATALOG if s.category == "translation"]
+        self.assertEqual(len(llm_specs), 3)
+
+        for spec in llm_specs:
+            self.assertIn("Qwen3", spec.name)
+            self.assertIn("Qwen3", spec.repo_id)
+            self.assertIn("Qwen3", spec.filename)
+            self.assertNotIn("Qwen2.5", spec.repo_id)
+            self.assertNotIn("qwen2.5", spec.filename.lower())
 
     def test_system_prompt_requirements(self):
         """Valida que o prompt de sistema contém diretrizes para nomes próprios, tom e sem comentários."""

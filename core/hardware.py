@@ -39,6 +39,9 @@ class ModelProfile:
         whisper_variant: Variante do faster-whisper (large-v3, distil-large-v3, small).
         whisper_compute_type: Tipo de computação (float16, int8_float16, int8).
         translation_model: Nome/identificador do modelo LLM para tradução.
+        translation_model_family: Família do modelo LLM ("Qwen3").
+        translation_repo_id: Identificador do repositório Hugging Face ("Qwen/Qwen3-8B-Instruct-GGUF").
+        translation_filename: Nome do arquivo GGUF ("Qwen3-8B-Instruct-Q4_K_M.gguf").
         default_tts_engine: Engine padrão de síntese de voz (F5-TTS).
         enable_indextts_2: Se a opção avançada de IndexTTS-2 deve ser habilitada na UI.
         musetalk_use_float16: Se a flag --use_float16 do MuseTalk é obrigatória/ativada.
@@ -46,7 +49,10 @@ class ModelProfile:
     profile_name: str = "cpu"
     whisper_variant: str = "small"
     whisper_compute_type: str = "int8"
-    translation_model: str = "Qwen3-1.5B-Instruct Q4_K_M"
+    translation_model: str = "Qwen3-1.5B-Instruct-Q4_K_M"
+    translation_model_family: str = "Qwen3"
+    translation_repo_id: str = "Qwen/Qwen3-1.5B-Instruct-GGUF"
+    translation_filename: str = "Qwen3-1.5B-Instruct-Q4_K_M.gguf"
     default_tts_engine: str = "F5-TTS"
     enable_indextts_2: bool = False
     musetalk_use_float16: bool = False
@@ -73,7 +79,10 @@ class ModelProfile:
                 profile_name="perfil_a",
                 whisper_variant="large-v3",
                 whisper_compute_type="float16",
-                translation_model="Qwen3-8B-Instruct Q4_K_M",
+                translation_model="Qwen3-8B-Instruct-Q4_K_M",
+                translation_model_family="Qwen3",
+                translation_repo_id="Qwen/Qwen3-8B-Instruct-GGUF",
+                translation_filename="Qwen3-8B-Instruct-Q4_K_M.gguf",
                 default_tts_engine="F5-TTS",
                 enable_indextts_2=True,
                 musetalk_use_float16=False,  # Opcional em perfil_a
@@ -83,7 +92,10 @@ class ModelProfile:
                 profile_name="perfil_b",
                 whisper_variant="distil-large-v3",
                 whisper_compute_type="int8_float16",
-                translation_model="Qwen3-4B-Instruct Q4_K_M",
+                translation_model="Qwen3-4B-Instruct-Q4_K_M",
+                translation_model_family="Qwen3",
+                translation_repo_id="Qwen/Qwen3-4B-Instruct-GGUF",
+                translation_filename="Qwen3-4B-Instruct-Q4_K_M.gguf",
                 default_tts_engine="F5-TTS",
                 enable_indextts_2=False,     # Apenas perfil_a (8GB+)
                 musetalk_use_float16=True,   # Obrigatório em perfil_b
@@ -93,7 +105,10 @@ class ModelProfile:
                 profile_name="cpu",
                 whisper_variant="small",
                 whisper_compute_type="int8",
-                translation_model="Qwen3-1.5B-Instruct Q4_K_M",
+                translation_model="Qwen3-1.5B-Instruct-Q4_K_M",
+                translation_model_family="Qwen3",
+                translation_repo_id="Qwen/Qwen3-1.5B-Instruct-GGUF",
+                translation_filename="Qwen3-1.5B-Instruct-Q4_K_M.gguf",
                 default_tts_engine="F5-TTS",
                 enable_indextts_2=False,
                 musetalk_use_float16=False,
@@ -168,11 +183,12 @@ def sync_hardware_config(
     config_path: str = "config.yaml",
 ) -> Dict[str, Any]:
     """
-    ÚNICA função responsável por persistir e sincronizar todas as chaves de hardware no config.yaml.
+    ÚNICA função responsável por persistir e sincronizar todas as chaves de hardware e modelos no config.yaml.
     
     Garante que:
         - A chave raiz 'gpu_profile' seja exatamente igual a 'hardware.profile'.
         - 'hardware.compute_type' seja consistente com o ModelProfile correspondente.
+        - 'models.translation' tenha model_family='Qwen3', repo_id e filename estritamente correspondentes ao perfil.
         - 'hardware.vram_detected_gb' e 'hardware.device' reflitam o hardware real.
     """
     path = Path(config_path).resolve()
@@ -191,10 +207,10 @@ def sync_hardware_config(
 
     model_prof = ModelProfile.from_profile(norm_profile)
 
-    # Atualiza chave raiz
+    # 1. Atualiza chave raiz
     data["gpu_profile"] = norm_profile
 
-    # Atualiza seção aninhada 'hardware'
+    # 2. Atualiza seção aninhada 'hardware'
     if "hardware" not in data or not isinstance(data["hardware"], dict):
         data["hardware"] = {}
 
@@ -204,13 +220,27 @@ def sync_hardware_config(
     data["hardware"]["device_name"] = device_name
     data["hardware"]["vram_detected_gb"] = round(vram_gb, 2)
 
+    # 3. Atualiza seção 'models' (translation e transcription)
+    if "models" not in data or not isinstance(data["models"], dict):
+        data["models"] = {}
+
+    if "translation" not in data["models"] or not isinstance(data["models"]["translation"], dict):
+        data["models"]["translation"] = {}
+    data["models"]["translation"]["model_family"] = model_prof.translation_model_family
+    data["models"]["translation"]["repo_id"] = model_prof.translation_repo_id
+    data["models"]["translation"]["filename"] = model_prof.translation_filename
+
+    if "transcription" not in data["models"] or not isinstance(data["models"]["transcription"], dict):
+        data["models"]["transcription"] = {}
+    data["models"]["transcription"]["model_size"] = model_prof.whisper_variant
+
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             yaml.dump(data, f, allow_unicode=True, default_flow_style=False)
         logger.info(
-            "Configuração de hardware sincronizada em '%s': gpu_profile='%s', hardware.profile='%s', compute_type='%s', vram=%.2f GB",
-            path.name, norm_profile, norm_profile, model_prof.whisper_compute_type, vram_gb
+            "Configuração sincronizada em '%s': gpu_profile='%s', hardware.profile='%s', compute_type='%s', translation='%s', vram=%.2f GB",
+            path.name, norm_profile, norm_profile, model_prof.whisper_compute_type, model_prof.translation_filename, vram_gb
         )
     except Exception as e:
         logger.warning("Não foi possível salvar configurações em '%s': %s", path, e)
@@ -256,8 +286,6 @@ def detect_gpu_profile(config_path: str = "config.yaml", force_redetect: bool = 
         saved_profile = _load_gpu_profile_from_config(config_path)
         # Se houver perfil salvo, valida se coincide com o hardware físico atual
         if saved_profile is not None:
-            # Se o hardware físico for CUDA e tiver capacidade para perfil_a/perfil_b,
-            # mas o config tiver salvo "cpu" ou perfil divergente, força ressincronização!
             if saved_profile == physical_profile:
                 logger.debug("Perfil de GPU verificado e compatível com o config: %s", saved_profile)
                 return saved_profile

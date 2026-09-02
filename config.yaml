@@ -43,11 +43,11 @@ models:
     vad_min_silence_duration_ms: 500
   translation:
     context_window: 4096
-    filename: qwen2.5-7b-instruct-q4_k_m.gguf
+    filename: Qwen3-8B-Instruct-Q4_K_M.gguf
     model_family: Qwen3
     n_gpu_layers: -1
     provider: llama-cpp-python
-    repo_id: Qwen/Qwen2.5-7B-Instruct-GGUF
+    repo_id: Qwen/Qwen3-8B-Instruct-GGUF
     temperature: 0.3
   voice_clone:
     cross_fade_duration: 0.15

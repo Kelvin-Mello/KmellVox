@@ -125,6 +125,8 @@ class Translator:
 
     def _resolve_model_filename(self) -> str:
         """Determina o nome do arquivo .gguf com base no ModelProfile."""
+        if hasattr(self.profile, "translation_filename") and self.profile.translation_filename:
+            return self.profile.translation_filename
         if self.profile.profile_name == "perfil_a":
             return "Qwen3-8B-Instruct-Q4_K_M.gguf"
         elif self.profile.profile_name == "perfil_b":
