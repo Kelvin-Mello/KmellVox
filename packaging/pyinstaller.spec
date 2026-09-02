@@ -49,12 +49,14 @@ hiddenimports = [
     'core.lipsync',
     'core.assemble',
     'core.pipeline',
+    'core.narration',
     'downloader',
     'downloader.fetch_models',
     'ui',
     'ui.main_window',
     'ui.queue_widget',
     'ui.settings_dialog',
+    'ui.narration_tab',
 ]
 
 # Adiciona submódulos dinâmicos de bibliotecas que utilizam lazy-loading

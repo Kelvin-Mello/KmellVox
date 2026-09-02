@@ -1,11 +1,10 @@
 """Janela Principal da Aplicação KmellVox em PySide6.
 
 Inclui:
-- Área de arrastar e soltar (drag-and-drop) para vídeos.
-- Lista multi-seleção de idiomas de destino para lote (N vídeos x M idiomas).
-- Painel de opções (Sincronia Labial experimental, Legendas, Formato de Saída, Controle de Ritmo).
-- Toggle de IndexTTS-2 condicional com tooltip por VRAM.
-- Barra de progresso por vídeo e progresso geral da fila com QThread sem travamento da UI.
+- Aba 1: 🎬 Dublagem de Vídeo (Pipeline de vídeo com IA, extração, tradução, clonagem, lip sync e fila).
+- Aba 2: 🎙️ Gerador de Narração (Síntese de áudio a partir de texto puro ou legendas SRT).
+- Header unificado com perfil de hardware em tempo real e acesso a configurações.
+- Execução assíncrona com QThread sem bloqueio de interface.
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -38,6 +37,8 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QSlider,
     QSplitter,
+    QTabBar,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -45,6 +46,7 @@ from PySide6.QtWidgets import (
 
 from core.hardware import detect_hardware
 from core.pipeline import DubPipeline, PipelineConfig, PipelineProgress
+from .narration_tab import NarrationTab
 from .queue_widget import JobItem, QueueWidget
 from .settings_dialog import SettingsDialog
 
@@ -67,6 +69,37 @@ QMainWindow, QWidget {
     color: #E1E1E6;
     font-family: 'Segoe UI', Arial, sans-serif;
     font-size: 13px;
+}
+
+QTabWidget::pane {
+    border: 1px solid #29292E;
+    border-radius: 8px;
+    background-color: #121214;
+    top: -1px;
+}
+
+QTabBar::tab {
+    background-color: #19191B;
+    color: #A8A8B3;
+    border: 1px solid #29292E;
+    border-bottom: none;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    padding: 8px 20px;
+    margin-right: 4px;
+    font-weight: 500;
+}
+
+QTabBar::tab:selected {
+    background-color: #202024;
+    color: #04D361;
+    border-color: #323238;
+    font-weight: bold;
+}
+
+QTabBar::tab:hover:!selected {
+    background-color: #29292E;
+    color: #E1E1E6;
 }
 
 QGroupBox {
@@ -121,7 +154,7 @@ QPushButton#btn_primary:hover {
     background-color: #9466FF;
 }
 
-QTableWidget, QListWidget {
+QTableWidget, QListWidget, QPlainTextEdit {
     background-color: #19191B;
     border: 1px solid #29292E;
     border-radius: 6px;
@@ -266,7 +299,6 @@ class DropArea(QFrame):
             if os.path.isfile(path) and Path(path).suffix.lower() in SUPPORTED_VIDEO_EXTS:
                 valid_paths.append(path)
             elif os.path.isdir(path):
-                # Varre pasta
                 for root, _, files in os.walk(path):
                     for f in files:
                         if Path(f).suffix.lower() in SUPPORTED_VIDEO_EXTS:
@@ -331,12 +363,12 @@ class PipelineWorkerThread(QThread):
 
 
 class MainWindow(QMainWindow):
-    """Janela Principal Completa do KmellVox."""
+    """Janela Principal Completa do KmellVox Studio."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("KmellVox - Dublagem, Clonagem de Voz e Lip Sync com IA")
-        self.resize(1140, 840)
+        self.setWindowTitle("KmellVox Studio - Dublagem, Narração e Clonagem de Voz com IA")
+        self.resize(1180, 880)
         self.setStyleSheet(DARK_THEME_QSS)
 
         self.worker_thread: Optional[PipelineWorkerThread] = None
@@ -347,10 +379,10 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(16, 16, 16, 16)
-        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(14, 14, 14, 14)
+        main_layout.setSpacing(8)
 
-        # 1. Header (Título, Badge de Hardware e Botão de Configurações)
+        # 1. Header Global
         header_layout = QHBoxLayout()
         title_label = QLabel("🎙️ KmellVox Studio")
         title_label.setFont(QFont("Segoe UI", 16, QFont.Bold))
@@ -370,21 +402,29 @@ class MainWindow(QMainWindow):
 
         main_layout.addLayout(header_layout)
 
-        # 2. Área Superior Dividida: (Drop Area + Multi-Seleção de Idiomas + Painel de Opções)
+        # 2. QTabWidget com Abas: (1) Dublagem de Vídeo, (2) Gerador de Narração
+        self.tabs = QTabWidget()
+
+        # =====================================================================
+        # ABA 1: DUBLAGEM DE VÍDEO
+        # =====================================================================
+        self.tab_dubbing = QWidget()
+        dubbing_layout = QVBoxLayout(self.tab_dubbing)
+        dubbing_layout.setContentsMargins(8, 8, 8, 8)
+        dubbing_layout.setSpacing(8)
+
         top_splitter = QSplitter(Qt.Horizontal)
 
-        # 2.1 Coluna Esquerda: Área de Drop e Idiomas de Destino
+        # Coluna Esquerda da Dublagem: Drop + Idiomas
         left_box = QWidget()
         left_layout = QVBoxLayout(left_box)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(8)
 
-        # Área de Drop
         self.drop_area = DropArea()
         self.drop_area.files_dropped.connect(self._on_files_dropped)
         left_layout.addWidget(self.drop_area)
 
-        # Lista de Idiomas de Destino (Multi-seleção)
         lang_group = QGroupBox("Idiomas de Destino (Processamento em Lote)")
         lang_layout = QVBoxLayout(lang_group)
 
@@ -397,7 +437,6 @@ class MainWindow(QMainWindow):
             self.list_languages.addItem(item)
         lang_layout.addWidget(self.list_languages)
 
-        # Botões de Seleção Rápida de Idiomas
         lang_btns_layout = QHBoxLayout()
         btn_sel_all = QPushButton("Selecionar Todos")
         btn_sel_all.clicked.connect(self._select_all_languages)
@@ -410,7 +449,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(lang_group)
         top_splitter.addWidget(left_box)
 
-        # 2.2 Coluna Direita: Painel de Opções, Ritmo e IndexTTS-2
+        # Coluna Direita da Dublagem: Opções, Ritmo, IndexTTS-2 e LipSync
         right_box = QWidget()
         right_layout = QVBoxLayout(right_box)
         right_layout.setContentsMargins(0, 0, 0, 0)
@@ -420,7 +459,6 @@ class MainWindow(QMainWindow):
         opts_layout = QVBoxLayout(opts_group)
         opts_layout.setSpacing(8)
 
-        # Formato de Saída
         row_format = QHBoxLayout()
         row_format.addWidget(QLabel("Formato de Saída:"))
         self.cb_output_format = QComboBox()
@@ -432,26 +470,22 @@ class MainWindow(QMainWindow):
         row_format.addWidget(self.cb_output_format)
         opts_layout.addLayout(row_format)
 
-        # Legendas
         self.chk_burn_subs = QCheckBox("Estampar Legendas Embutidas no Vídeo (Burn-in)")
         self.chk_burn_subs.setChecked(False)
         opts_layout.addWidget(self.chk_burn_subs)
 
-        # Toggle IndexTTS-2
         self.chk_indextts2 = QCheckBox("Qualidade máxima de voz (IndexTTS-2)")
         self.chk_indextts2.setChecked(False)
         opts_layout.addWidget(self.chk_indextts2)
 
-        # Controle de Ritmo (Sliders)
         rhythm_box = QGroupBox("Controle de Ritmo (Ajuste de Fala)")
         rhythm_layout = QVBoxLayout(rhythm_box)
 
-        # Desaceleração Máxima
         row_slow = QHBoxLayout()
         row_slow.addWidget(QLabel("Desaceleração Máx:"))
         self.slider_min_speed = QSlider(Qt.Horizontal)
-        self.slider_min_speed.setRange(50, 100)  # 0.50x a 1.00x
-        self.slider_min_speed.setValue(70)      # 0.70x padrão
+        self.slider_min_speed.setRange(50, 100)
+        self.slider_min_speed.setValue(70)
         self.lbl_min_speed_val = QLabel("0.70x (70%)")
         self.slider_min_speed.valueChanged.connect(
             lambda v: self.lbl_min_speed_val.setText(f"{v/100:.2f}x ({v}%)")
@@ -460,12 +494,11 @@ class MainWindow(QMainWindow):
         row_slow.addWidget(self.lbl_min_speed_val)
         rhythm_layout.addLayout(row_slow)
 
-        # Aceleração Máxima
         row_fast = QHBoxLayout()
         row_fast.addWidget(QLabel("Aceleração Máx:"))
         self.slider_max_speed = QSlider(Qt.Horizontal)
-        self.slider_max_speed.setRange(100, 200) # 1.00x a 2.00x
-        self.slider_max_speed.setValue(135)     # 1.35x padrão
+        self.slider_max_speed.setRange(100, 200)
+        self.slider_max_speed.setValue(135)
         self.lbl_max_speed_val = QLabel("1.35x (135%)")
         self.slider_max_speed.valueChanged.connect(
             lambda v: self.lbl_max_speed_val.setText(f"{v/100:.2f}x ({v}%)")
@@ -476,7 +509,6 @@ class MainWindow(QMainWindow):
 
         opts_layout.addWidget(rhythm_box)
 
-        # Sincronia Labial Experimental
         exp_group = QGroupBox("Recursos Experimentais")
         exp_group.setObjectName("experimental_group")
         exp_layout = QVBoxLayout(exp_group)
@@ -484,8 +516,7 @@ class MainWindow(QMainWindow):
         self.chk_lipsync = QCheckBox("⚠️ Sincronia Labial Facial - MuseTalk 1.5 (Experimental / Instável)")
         self.chk_lipsync.setChecked(False)
         self.chk_lipsync.setToolTip(
-            "Recurso experimental: O MuseTalk 1.5 gera movimentos labiais realistas adaptados à nova fala, "
-            "mas pode apresentar instabilidade ou artefatos dependendo do ângulo da face e iluminação da cena."
+            "Recurso experimental: O MuseTalk 1.5 gera movimentos labiais realistas adaptados à nova fala."
         )
         self.chk_lipsync.setStyleSheet("color: #FFA200; font-weight: bold;")
         exp_layout.addWidget(self.chk_lipsync)
@@ -495,17 +526,14 @@ class MainWindow(QMainWindow):
         top_splitter.addWidget(right_box)
 
         top_splitter.setSizes([500, 500])
-        main_layout.addWidget(top_splitter)
+        dubbing_layout.addWidget(top_splitter)
 
-        # 3. Fila de Renderização & Console de Logs
+        # Fila e Controles da Dublagem
         splitter_bottom = QSplitter(Qt.Vertical)
-
-        # Fila
         self.queue_widget = QueueWidget()
         self.queue_widget.job_cancelled.connect(self._on_job_cancelled)
         splitter_bottom.addWidget(self.queue_widget)
 
-        # Console de Logs
         log_box = QWidget()
         log_layout = QVBoxLayout(log_box)
         log_layout.setContentsMargins(0, 0, 0, 0)
@@ -515,14 +543,13 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(self.txt_logs)
         splitter_bottom.addWidget(log_box)
 
-        splitter_bottom.setSizes([260, 120])
-        main_layout.addWidget(splitter_bottom, stretch=1)
+        splitter_bottom.setSizes([200, 100])
+        dubbing_layout.addWidget(splitter_bottom, stretch=1)
 
-        # 4. Barras de Progresso e Ações Inferiores
+        # Barra de Progresso da Dublagem
         progress_panel = QGroupBox("Progresso de Execução")
         prog_layout = QVBoxLayout(progress_panel)
 
-        # Progresso por Vídeo Atual (com indicador de etapa do pipeline)
         row_prog_cur = QHBoxLayout()
         self.lbl_current_stage = QLabel("Etapa Atual: Ocioso")
         self.lbl_current_stage.setStyleSheet("font-weight: 500; color: #04D361;")
@@ -533,10 +560,9 @@ class MainWindow(QMainWindow):
         self.prog_bar_current = QProgressBar()
         self.prog_bar_current.setRange(0, 100)
         self.prog_bar_current.setValue(0)
-        self.prog_bar_current.setFixedHeight(22)
+        self.prog_bar_current.setFixedHeight(20)
         prog_layout.addWidget(self.prog_bar_current)
 
-        # Progresso Geral da Fila
         row_prog_queue = QHBoxLayout()
         self.lbl_queue_progress = QLabel("Fila Geral: 0/0 vídeos concluídos")
         self.lbl_queue_progress.setStyleSheet("color: #A8A8B3; font-size: 11px;")
@@ -547,29 +573,40 @@ class MainWindow(QMainWindow):
         self.prog_bar_queue = QProgressBar()
         self.prog_bar_queue.setRange(0, 100)
         self.prog_bar_queue.setValue(0)
-        self.prog_bar_queue.setFixedHeight(14)
+        self.prog_bar_queue.setFixedHeight(12)
         prog_layout.addWidget(self.prog_bar_queue)
 
-        main_layout.addWidget(progress_panel)
+        dubbing_layout.addWidget(progress_panel)
 
-        # Botões de Ação
         actions_layout = QHBoxLayout()
         self.lbl_status = QLabel("Pronto para processar.")
         actions_layout.addWidget(self.lbl_status, stretch=1)
 
         self.btn_start = QPushButton("▶️ Iniciar Fila de Dublagem")
         self.btn_start.setObjectName("btn_primary")
-        self.btn_start.setFixedHeight(40)
+        self.btn_start.setFixedHeight(38)
         self.btn_start.clicked.connect(self._start_processing)
         actions_layout.addWidget(self.btn_start)
 
         self.btn_cancel = QPushButton("⏹️ Cancelar Fila")
         self.btn_cancel.setEnabled(False)
-        self.btn_cancel.setFixedHeight(40)
+        self.btn_cancel.setFixedHeight(38)
         self.btn_cancel.clicked.connect(self._cancel_processing)
         actions_layout.addWidget(self.btn_cancel)
 
-        main_layout.addLayout(actions_layout)
+        dubbing_layout.addLayout(actions_layout)
+
+        # Adiciona Aba 1
+        self.tabs.addTab(self.tab_dubbing, "🎬 Dublagem de Vídeo")
+
+        # =====================================================================
+        # ABA 2: GERADOR DE NARRAÇÃO (TEXTO / SRT)
+        # =====================================================================
+        self.tab_narration = NarrationTab(self)
+        self.tab_narration.log_signal.connect(self._log)
+        self.tabs.addTab(self.tab_narration, "🎙️ Gerador de Narração")
+
+        main_layout.addWidget(self.tabs, stretch=1)
 
     def _refresh_hardware_status(self) -> None:
         hw = detect_hardware()
@@ -579,7 +616,6 @@ class MainWindow(QMainWindow):
             self.badge_hardware.setText(f"💻 CPU Mode ({hw.cpu_cores} cores)")
             self.badge_hardware.setStyleSheet("background-color: #383840; color: #FFA200; padding: 5px 12px; border-radius: 12px;")
 
-        # Toggle IndexTTS-2 desabilitado automaticamente em perfil_b com tooltip explicativo
         if hw.model_profile.enable_indextts_2:
             self.chk_indextts2.setEnabled(True)
             self.chk_indextts2.setToolTip("IndexTTS-2 em FP16 com controle nativo de duração (Habilitado para perfil_a 8GB+ VRAM).")
@@ -590,6 +626,9 @@ class MainWindow(QMainWindow):
                 f"Qualidade máxima (IndexTTS-2) requer no mínimo 8GB de VRAM (perfil_a). "
                 f"Seu perfil detectado é '{hw.model_profile.profile_name}', utilizando F5-TTS com Controle de Ritmo."
             )
+
+        if hasattr(self, "tab_narration"):
+            self.tab_narration._check_preset_voices()
 
     def _select_all_languages(self) -> None:
         for i in range(self.list_languages.count()):
@@ -640,7 +679,7 @@ class MainWindow(QMainWindow):
                 self.queue_widget.add_job(job)
                 added_count += 1
 
-        self._log(f"Adicionado(s) {added_count} trabalho(s) à fila de renderização.")
+        self._log(f"Adicionado(s) {added_count} trabalho(s) à fila de renderização de vídeo.")
 
     def _start_processing(self) -> None:
         pending_jobs = self.queue_widget.get_pending_jobs()

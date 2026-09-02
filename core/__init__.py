@@ -1,4 +1,4 @@
-"""KmellVox Core Module - Dublagem, Tradução e Lip Sync com IA."""
+"""KmellVox Core Module - Dublagem, Tradução, Narração e Lip Sync com IA."""
 
 from .hardware import (
     detect_gpu_profile,
@@ -50,6 +50,13 @@ from .pipeline import (
     PipelineConfig,
     PipelineProgress,
 )
+from .narration import (
+    detect_text_format,
+    parse_srt,
+    list_preset_voices,
+    NarrationJob,
+    NarrationEngine,
+)
 
 __all__ = [
     "detect_gpu_profile",
@@ -89,4 +96,9 @@ __all__ = [
     "DubbingPipeline",
     "PipelineConfig",
     "PipelineProgress",
+    "detect_text_format",
+    "parse_srt",
+    "list_preset_voices",
+    "NarrationJob",
+    "NarrationEngine",
 ]
