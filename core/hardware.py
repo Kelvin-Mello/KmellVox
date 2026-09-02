@@ -15,7 +15,7 @@ import shutil
 import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 import yaml
 
@@ -27,6 +27,16 @@ class HardwareProfile(str, enum.Enum):
     PERFIL_A = "perfil_a"      # VRAM >= 7.5 GB
     PERFIL_B = "perfil_b"      # 5.0 GB <= VRAM < 7.5 GB
     CPU = "cpu"                # Sem GPU CUDA ou VRAM < 5.0 GB
+
+
+class WhisperModelVariant(str, enum.Enum):
+    """Variantes válidas e homologadas do Faster-Whisper no KmellVox."""
+    LARGE_V3 = "large-v3"               # Exclusivo de perfil_a
+    DISTIL_LARGE_V3 = "distil-large-v3" # Exclusivo de perfil_b
+    SMALL = "small"                     # Exclusivo de cpu (ou fallback)
+
+
+VALID_WHISPER_VARIANTS: Set[str] = {v.value for v in WhisperModelVariant}
 
 
 @dataclass
@@ -57,6 +67,14 @@ class ModelProfile:
     enable_indextts_2: bool = False
     musetalk_use_float16: bool = False
 
+    def __post_init__(self) -> None:
+        """Valida que whisper_variant pertence estritamente ao conjunto de variantes homologadas."""
+        if self.whisper_variant not in VALID_WHISPER_VARIANTS:
+            raise ValueError(
+                f"Variante do Whisper inválida: '{self.whisper_variant}'. "
+                f"A especificação do KmellVox aceita apenas: {sorted(list(VALID_WHISPER_VARIANTS))}"
+            )
+
     @classmethod
     def from_profile(cls, profile_name: Optional[str] = None, config_path: str = "config.yaml") -> "ModelProfile":
         """
@@ -77,7 +95,7 @@ class ModelProfile:
         if norm in ("perfil_a", "high_vram", "mid_vram"):
             return cls(
                 profile_name="perfil_a",
-                whisper_variant="large-v3",
+                whisper_variant=WhisperModelVariant.LARGE_V3.value,
                 whisper_compute_type="float16",
                 translation_model="Qwen3-8B-Instruct-Q4_K_M",
                 translation_model_family="Qwen3",
@@ -90,7 +108,7 @@ class ModelProfile:
         elif norm in ("perfil_b", "low_vram"):
             return cls(
                 profile_name="perfil_b",
-                whisper_variant="distil-large-v3",
+                whisper_variant=WhisperModelVariant.DISTIL_LARGE_V3.value,
                 whisper_compute_type="int8_float16",
                 translation_model="Qwen3-4B-Instruct-Q4_K_M",
                 translation_model_family="Qwen3",
@@ -103,7 +121,7 @@ class ModelProfile:
         else:  # Modo CPU
             return cls(
                 profile_name="cpu",
-                whisper_variant="small",
+                whisper_variant=WhisperModelVariant.SMALL.value,
                 whisper_compute_type="int8",
                 translation_model="Qwen3-1.5B-Instruct-Q4_K_M",
                 translation_model_family="Qwen3",
@@ -189,6 +207,7 @@ def sync_hardware_config(
         - A chave raiz 'gpu_profile' seja exatamente igual a 'hardware.profile'.
         - 'hardware.compute_type' seja consistente com o ModelProfile correspondente.
         - 'models.translation' tenha model_family='Qwen3', repo_id e filename estritamente correspondentes ao perfil.
+        - 'models.transcription.model_size' seja estritamente 'large-v3' (perfil_a), 'distil-large-v3' (perfil_b) ou 'small' (cpu).
         - 'hardware.vram_detected_gb' e 'hardware.device' reflitam o hardware real.
     """
     path = Path(config_path).resolve()
@@ -239,8 +258,8 @@ def sync_hardware_config(
         with open(path, "w", encoding="utf-8") as f:
             yaml.dump(data, f, allow_unicode=True, default_flow_style=False)
         logger.info(
-            "Configuração sincronizada em '%s': gpu_profile='%s', hardware.profile='%s', compute_type='%s', translation='%s', vram=%.2f GB",
-            path.name, norm_profile, norm_profile, model_prof.whisper_compute_type, model_prof.translation_filename, vram_gb
+            "Configuração sincronizada em '%s': gpu_profile='%s', hardware.profile='%s', compute_type='%s', whisper='%s', translation='%s', vram=%.2f GB",
+            path.name, norm_profile, norm_profile, model_prof.whisper_compute_type, model_prof.whisper_variant, model_prof.translation_filename, vram_gb
         )
     except Exception as e:
         logger.warning("Não foi possível salvar configurações em '%s': %s", path, e)
@@ -284,7 +303,6 @@ def detect_gpu_profile(config_path: str = "config.yaml", force_redetect: bool = 
 
     if not force_redetect:
         saved_profile = _load_gpu_profile_from_config(config_path)
-        # Se houver perfil salvo, valida se coincide com o hardware físico atual
         if saved_profile is not None:
             if saved_profile == physical_profile:
                 logger.debug("Perfil de GPU verificado e compatível com o config: %s", saved_profile)

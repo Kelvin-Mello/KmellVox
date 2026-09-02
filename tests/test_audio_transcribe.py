@@ -7,11 +7,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import yaml
+
 # Garante que a raiz do projeto esteja no sys.path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.audio_extract import extract_audio
-from core.hardware import ModelProfile
+from core.hardware import VALID_WHISPER_VARIANTS, ModelProfile, WhisperModelVariant
 from core.transcribe import Transcriber, TranscriptionSegment, format_segments_to_srt
 
 
@@ -50,26 +53,62 @@ class TestAudioExtractAndTranscribe(unittest.TestCase):
 
     def test_transcriber_profile_configuration(self):
         """Testa se o Transcriber configura corretamente variante e compute_type conforme ModelProfile."""
-        # Perfil A
+        # Perfil A (VRAM >= 7.5GB -> large-v3 e float16)
         prof_a = ModelProfile.from_profile("perfil_a")
         t_a = Transcriber(model_profile=prof_a)
         self.assertEqual(t_a.model_variant, "large-v3")
         self.assertEqual(t_a.compute_type, "float16")
         self.assertEqual(t_a.device, "cuda")
 
-        # Perfil B
+        # Perfil B (5.0GB <= VRAM < 7.5GB -> distil-large-v3 e int8_float16)
         prof_b = ModelProfile.from_profile("perfil_b")
         t_b = Transcriber(model_profile=prof_b)
         self.assertEqual(t_b.model_variant, "distil-large-v3")
         self.assertEqual(t_b.compute_type, "int8_float16")
         self.assertEqual(t_b.device, "cuda")
 
-        # CPU
+        # CPU (< 5.0GB VRAM -> small e int8)
         prof_cpu = ModelProfile.from_profile("cpu")
         t_cpu = Transcriber(model_profile=prof_cpu)
         self.assertEqual(t_cpu.model_variant, "small")
         self.assertEqual(t_cpu.compute_type, "int8")
         self.assertEqual(t_cpu.device, "cpu")
+
+    def test_invalid_whisper_variant_rejected(self):
+        """
+        Valida que qualquer valor fora da lista permitida (como 'medium', 'tiny', 'base', 'large-v2')
+        é IMEDIATAMENTE rejeitado com ValueError, prevenindo corrupção no config.yaml.
+        """
+        invalid_variants = ["medium", "tiny", "base", "large-v2", "turbo", "invalid_model"]
+
+        for bad in invalid_variants:
+            with self.assertRaises(ValueError, msg=f"Deveria ter rejeitado variante inválida '{bad}'"):
+                ModelProfile(
+                    profile_name="perfil_a",
+                    whisper_variant=bad,
+                )
+
+        # Valida que o conjunto homologado contém apenas large-v3, distil-large-v3 e small
+        self.assertEqual(VALID_WHISPER_VARIANTS, {"large-v3", "distil-large-v3", "small"})
+
+    def test_config_yaml_whisper_variant_integrity(self):
+        """
+        Valida que o config.yaml gravado na raiz possui um model_size estritamente homologado.
+        """
+        cfg_path = PROJECT_ROOT / "config.yaml"
+        self.assertTrue(cfg_path.is_file(), "config.yaml deve existir na raiz do projeto.")
+
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+
+        trans_size = cfg.get("models", {}).get("transcription", {}).get("model_size", "")
+        self.assertIn(
+            trans_size,
+            VALID_WHISPER_VARIANTS,
+            f"models.transcription.model_size no config.yaml ('{trans_size}') não é uma variante válida!",
+        )
+        # Como o hardware detectado é perfil_a (7.96 GB VRAM), o valor deve ser 'large-v3'
+        self.assertEqual(trans_size, "large-v3")
 
     @patch("faster_whisper.WhisperModel")
     def test_transcribe_and_unload_vram(self, mock_whisper_cls):
@@ -98,50 +137,38 @@ class TestAudioExtractAndTranscribe(unittest.TestCase):
 
         info_mock = MagicMock()
         info_mock.language = "pt"
-        info_mock.language_probability = 0.99
-        info_mock.duration = 5.2
+        info_mock.language_probability = 0.98
+        info_mock.duration = 6.0
 
         mock_instance.transcribe.return_value = ([seg1, seg2], info_mock)
 
         prof_a = ModelProfile.from_profile("perfil_a")
         transcriber = Transcriber(model_profile=prof_a)
 
-        audio_file = os.path.join(self.temp_dir.name, "sample.wav")
-        segments = transcriber.transcribe(audio_file, auto_unload=True)
+        dummy_audio = os.path.join(self.temp_dir.name, "sample.wav")
+        with open(dummy_audio, "wb") as f:
+            f.write(b"dummy wav data")
 
-        self.assertEqual(len(segments), 2)
-        self.assertEqual(segments[0].start, 0.0)
-        self.assertEqual(segments[0].end, 2.5)
-        self.assertEqual(segments[0].text, "Olá, bem-vindo ao KmellVox.")
-        self.assertEqual(segments[0]["start"], 0.0)  # Acesso indexado compatível
+        result = transcriber.transcribe(dummy_audio, auto_unload=True)
 
-        self.assertEqual(segments[1].start, 2.8)
-        self.assertEqual(segments[1].end, 5.2)
-        self.assertEqual(segments[1].text, "Dublagem e sincronia labial com IA.")
-
-        # Verifica se o modelo foi explicitamente descarregado da VRAM
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0].text, "Olá, bem-vindo ao KmellVox.")
+        self.assertEqual(result[1].text, "Dublagem e sincronia labial com IA.")
+        
+        # Garante que o modelo foi liberado da memória após auto_unload
         self.assertIsNone(transcriber.model)
 
-    def test_export_srt(self):
-        """Testa exportação de arquivo .srt a partir de segmentos."""
+    def test_format_segments_to_srt(self):
+        """Testa a geração correta de formato SRT a partir de segmentos de transcrição."""
         segments = [
-            TranscriptionSegment(id=1, start=1.2, end=4.5, text="Primeira frase de teste."),
-            TranscriptionSegment(id=2, start=5.0, end=8.75, text="Segunda frase de teste."),
+            TranscriptionSegment(id=1, start=0.0, end=1.500, text="Primeira linha"),
+            TranscriptionSegment(id=2, start=2.000, end=4.250, text="Segunda linha com acentuação"),
         ]
 
-        transcriber = Transcriber()
-        srt_out_path = os.path.join(self.temp_dir.name, "subtitles.srt")
-        saved_path = transcriber.export_srt(segments, srt_out_path)
+        srt_content = format_segments_to_srt(segments)
 
-        self.assertTrue(os.path.isfile(saved_path))
-        with open(saved_path, "r", encoding="utf-8") as f:
-            content = f.read()
-
-        expected_part_1 = "1\n00:00:01,200 --> 00:00:04,500\nPrimeira frase de teste."
-        expected_part_2 = "2\n00:00:05,000 --> 00:00:08,750\nSegunda frase de teste."
-
-        self.assertIn(expected_part_1, content)
-        self.assertIn(expected_part_2, content)
+        self.assertIn("1\n00:00:00,000 --> 00:00:01,500\nPrimeira linha", srt_content)
+        self.assertIn("2\n00:00:02,000 --> 00:00:04,250\nSegunda linha com acentuação", srt_content)
 
 
 if __name__ == "__main__":

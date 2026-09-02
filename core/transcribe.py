@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
-from core.hardware import ModelProfile
+from core.hardware import VALID_WHISPER_VARIANTS, ModelProfile, WhisperModelVariant
 
 logger = logging.getLogger("KmellVox.Transcribe")
 
@@ -122,6 +122,12 @@ class Transcriber:
         self.profile = model_profile or ModelProfile.from_profile()
         self.model_variant = self.profile.whisper_variant
         self.compute_type = self.profile.whisper_compute_type
+
+        if self.model_variant not in VALID_WHISPER_VARIANTS:
+            raise ValueError(
+                f"Variante do Whisper inválida: '{self.model_variant}'. "
+                f"As únicas variantes permitidas pela especificação do KmellVox são: {sorted(list(VALID_WHISPER_VARIANTS))}"
+            )
         
         if device is not None:
             self.device = device
