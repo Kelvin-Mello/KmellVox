@@ -1,0 +1,34 @@
+# ==============================================================================
+# KmellVox - Requisitos de GPU e Modelos de IA (PyTorch CUDA, F5-TTS, IndexTTS-2, MuseTalk)
+# ==============================================================================
+# IMPORTANTE: Instale primeiro o PyTorch com suporte a CUDA usando o índice oficial do PyTorch:
+#
+#   Windows / Linux (CUDA 12.4):
+#     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+#
+#   Windows / Linux (CUDA 12.1):
+#     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#
+# Em seguida, instale as dependências deste arquivo:
+#     pip install -r requirements-gpu.txt
+# ==============================================================================
+
+-r requirements.txt
+
+# PyTorch e Aceleração de Tensores
+torch>=2.2.0
+torchaudio>=2.2.0
+torchvision>=0.17.0
+accelerate>=0.28.0
+
+# Motor de Clonagem de Voz F5-TTS e Processamento de Áudio
+f5-tts>=0.1.0
+librosa>=0.10.1
+
+# Bibliotecas para MuseTalk 1.5 e IndexTTS-2
+diffusers>=0.27.0
+transformers>=4.38.0
+opencv-python>=4.8.0
+imageio>=2.34.0
+imageio-ffmpeg>=0.4.9
+timm>=0.9.16

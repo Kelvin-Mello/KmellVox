@@ -64,12 +64,39 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-### 2. Instalar as Dependências Base
+### 2. Instalar o PyTorch com Suporte a CUDA (Obrigatório para Aceleração por GPU)
 
+> [!IMPORTANT]
+> **Atenção:** Instalar o `torch` padrão via `pip install torch` sem especificar o `--index-url` oficial do PyTorch instalará a versão **CPU-only**, quebrando a detecção de VRAM da GPU (`torch.cuda.get_device_properties`), a clonagem de voz F5-TTS/IndexTTS-2 e a sincronia labial MuseTalk.
+
+Execute o comando correspondente à versão de CUDA suportada pela sua GPU:
+
+#### Para GPUs Modernas (RTX 40 / 50 Series - CUDA 12.4):
 ```powershell
-pip install --upgrade pip
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+```
+
+#### Para GPUs com CUDA 12.1:
+```powershell
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
+
+---
+
+### 3. Instalar as Dependências do KmellVox
+
+#### Opção A: Instalação Completa para GPU (Recomendada)
+Instala todas as dependências de IA (F5-TTS, MuseTalk 1.5, IndexTTS-2, aceleração de tensores e processamento de mídia):
+```powershell
+pip install -r requirements-gpu.txt
+```
+
+#### Opção B: Instalação Base (Leve / Modo CPU)
+```powershell
 pip install -r requirements.txt
 ```
+
+---
 
 ### ⚡ Aceleração por GPU no llama-cpp-python (CUDA / cuBLAS)
 
