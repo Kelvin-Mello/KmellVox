@@ -360,11 +360,12 @@ class NarrationTab(QWidget):
         voice_layout.addLayout(row_voice)
         left_layout.addWidget(voice_group)
 
-        # 3. Ritmo e Velocidade da Fala
-        speed_group = QGroupBox("3. Ritmo e Velocidade da Fala")
+        # 3. Ritmo e Pausas da Fala
+        speed_group = QGroupBox("3. Ritmo e Pausas da Fala")
         speed_layout = QVBoxLayout(speed_group)
-        speed_layout.setSpacing(4)
+        speed_layout.setSpacing(6)
 
+        # Linha 1: Velocidade
         row_spd = QHBoxLayout()
         row_spd.addWidget(QLabel("Velocidade:"))
         self.slider_speed = QSlider(Qt.Horizontal)
@@ -390,6 +391,34 @@ class NarrationTab(QWidget):
             row_presets_spd.addWidget(btn_spd)
         row_presets_spd.addStretch()
         speed_layout.addLayout(row_presets_spd)
+
+        # Linha 2: Pausa entre Frases (Respiro Natural pós-ponto)
+        row_pause = QHBoxLayout()
+        row_pause.addWidget(QLabel("Pausa pós-ponto:"))
+        self.slider_pause = QSlider(Qt.Horizontal)
+        self.slider_pause.setRange(20, 150)  # 0.20s a 1.50s
+        self.slider_pause.setValue(80)       # 0.80s padrão calibrado da voz original
+        self.slider_pause.setSingleStep(5)
+        self.slider_pause.valueChanged.connect(self._on_pause_slider_changed)
+        row_pause.addWidget(self.slider_pause, stretch=3)
+
+        self.lbl_pause_display = QLabel("0.80s (Original)")
+        self.lbl_pause_display.setStyleSheet("font-weight: bold; color: #04D361; min-width: 100px;")
+        row_pause.addWidget(self.lbl_pause_display)
+        speed_layout.addLayout(row_pause)
+
+        # Atalhos rápidos de pausa
+        row_presets_pause = QHBoxLayout()
+        pause_presets = [(0.40, "0.40s"), (0.60, "0.60s"), (0.80, "0.80s (Original)"), (1.00, "1.00s"), (1.20, "1.20s")]
+        for p_val, p_lbl in pause_presets:
+            btn_p = QPushButton(p_lbl)
+            btn_p.setFixedHeight(24)
+            btn_p.setStyleSheet("font-size: 11px; padding: 2px 8px;")
+            btn_p.clicked.connect(lambda _, v=int(p_val * 100): self.slider_pause.setValue(v))
+            row_presets_pause.addWidget(btn_p)
+        row_presets_pause.addStretch()
+        speed_layout.addLayout(row_presets_pause)
+
         left_layout.addWidget(speed_group)
 
         # 4. Masterização Vocal e Dinâmica de Estúdio
@@ -696,6 +725,15 @@ class NarrationTab(QWidget):
         else:
             self.lbl_speed_display.setText(f"{spd:.2f}x")
 
+    def _on_pause_slider_changed(self, val: int) -> None:
+        sec = val / 100.0
+        if abs(sec - 0.80) < 0.02:
+            self.lbl_pause_display.setText("0.80s (Original)")
+            self.lbl_pause_display.setStyleSheet("font-weight: bold; color: #04D361; min-width: 100px;")
+        else:
+            self.lbl_pause_display.setText(f"{sec:.2f}s")
+            self.lbl_pause_display.setStyleSheet("font-weight: bold; color: #E1E1E6; min-width: 100px;")
+
     def _on_param_slider_changed(self) -> None:
         bass = self.slider_bass.value() / 10.0
         treble = self.slider_treble.value() / 10.0
@@ -718,6 +756,10 @@ class NarrationTab(QWidget):
         except Exception:
             pass
 
+        pause_val = 0.80
+        if hasattr(self, "slider_pause"):
+            pause_val = self.slider_pause.value() / 100.0
+
         return AudioMasteringConfig(
             bass_gain_db=self.slider_bass.value() / 10.0,
             treble_gain_db=self.slider_treble.value() / 10.0,
@@ -726,6 +768,7 @@ class NarrationTab(QWidget):
             target_lufs=float(self.slider_lufs.value()),
             speech_speed=self.slider_speed.value() / 100.0,
             tempo_calibration=tempo_calib,
+            sentence_pause_seconds=pause_val,
             enabled=True,
         )
 
@@ -1124,6 +1167,7 @@ class NarrationTab(QWidget):
         dest_dir = self.txt_dest_folder.text().strip() or str(Path.home() / "Downloads")
 
         speed = self.slider_speed.value() / 100.0
+        pause_sec = self.slider_pause.value() / 100.0
         mastering_cfg = self._get_current_mastering_config()
 
         job_id = f"narr_job_{int(time.time() * 1000)}_{len(self.queue_jobs)}"
@@ -1136,6 +1180,7 @@ class NarrationTab(QWidget):
             reference_audio_path=ref_audio,
             split_mode=split_mode,
             speech_speed=speed,
+            sentence_pause_seconds=pause_sec,
             mastering_config=mastering_cfg,
             destination_folder=dest_dir,
             save_to_source_folder=save_source,

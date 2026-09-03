@@ -191,6 +191,7 @@ class AudioMasteringConfig:
     target_lufs: float = -16.0          # Padrão de loudness da indústria (broadcast/streaming)
     speech_speed: float = 1.0           # Fator de velocidade selecionado na UI (0.7x a 2.0x)
     tempo_calibration: float = 1.35     # Calibração acústica nativa para igualar 1.0x à cadência da voz original
+    sentence_pause_seconds: float = 0.80 # Pausa natural e respiro entre frases completas (. ! ?)
     enabled: bool = True
 
     def build_ffmpeg_filter(self) -> str:
@@ -229,6 +230,7 @@ class NarrationJob:
     preset_voice_id: Optional[str] = None        # Usado se voice_mode == "preset"
     split_mode: str = "unico"                     # "separado" | "unico" (para SRT)
     speech_speed: float = 1.4                     # Velocidade nativa da fala (0.7x a 2.0x)
+    sentence_pause_seconds: float = 0.80          # Pausa natural após ponto final em segundos
     mastering_config: Optional[AudioMasteringConfig] = None
     destination_folder: str = str(Path.home() / "Downloads")
     save_to_source_folder: bool = True
@@ -509,12 +511,18 @@ class NarrationEngine:
                 output_mp3_path = target_dir / f"{base_stem}.mp3"
                 temp_wav = temp_work_dir / f"{base_stem}_raw.wav"
 
-                notify(0.30, f"Sintetizando fala em alta fidelidade acústica (1x difusão)...")
+                pause_sec = (
+                    job.mastering_config.sentence_pause_seconds
+                    if job.mastering_config is not None
+                    else job.sentence_pause_seconds
+                )
+                notify(0.30, f"Sintetizando fala em alta fidelidade acústica (1x difusão, pausas de {pause_sec:.2f}s)...")
                 tts_engine.clone_and_synthesize(
                     text=job.source_text.strip(),
                     reference_audio_path=reference_audio,
                     output_path=str(temp_wav),
                     speed=1.0,
+                    sentence_pause_seconds=pause_sec,
                 )
 
                 notify(0.85, f"Masterizando áudio de estúdio ({job.speech_speed:.2f}x WSOLA, graves e dinâmica)...")
@@ -542,6 +550,12 @@ class NarrationEngine:
                 total = len(segments)
                 notify(0.10, f"Processando {total} trecho(s) de áudio individuais ({job.speech_speed:.2f}x)...")
 
+                pause_sec = (
+                    job.mastering_config.sentence_pause_seconds
+                    if job.mastering_config is not None
+                    else job.sentence_pause_seconds
+                )
+
                 for idx, seg in enumerate(segments, 1):
                     if self.is_cancelled:
                         raise RuntimeError("Operação cancelada pelo usuário.")
@@ -560,6 +574,7 @@ class NarrationEngine:
                         output_path=str(temp_seg_wav),
                         target_duration=seg.duration if self.model_profile.enable_indextts_2 else None,
                         speed=1.0,
+                        sentence_pause_seconds=pause_sec,
                     )
 
                     if job.mastering_config is not None:
@@ -588,6 +603,11 @@ class NarrationEngine:
 
                 pieces_to_concat: List[str] = []
                 current_timeline_time = 0.0
+                pause_sec = (
+                    job.mastering_config.sentence_pause_seconds
+                    if job.mastering_config is not None
+                    else job.sentence_pause_seconds
+                )
 
                 for idx, seg in enumerate(segments, 1):
                     if self.is_cancelled:
@@ -612,6 +632,7 @@ class NarrationEngine:
                         output_path=str(temp_speech_wav),
                         target_duration=seg.duration if self.model_profile.enable_indextts_2 else None,
                         speed=1.0,
+                        sentence_pause_seconds=pause_sec,
                     )
 
                     pieces_to_concat.append(str(temp_speech_wav))

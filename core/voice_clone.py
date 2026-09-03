@@ -276,6 +276,21 @@ class BaseTTSEngine(abc.ABC):
 _MAX_CHUNK_CHARS = 200
 _LONG_TEXT_THRESHOLD = 300  # Aciona chunking quando o texto excede este limite
 _MAX_REF_AUDIO_SECONDS = 15.0  # Limite máximo recomendado para áudio de referência no F5-TTS
+DEFAULT_SENTENCE_PAUSE_SECONDS = 0.80  # Pausa natural entre frases calibrada pela voz original (800ms)
+
+
+def split_text_into_sentences(text: str) -> List[str]:
+    """
+    Divide um texto em frases/sentenças completas preservando a pontuação terminativa.
+    Permite a injeção controlada de pausas naturais (respiros acústicos) entre as orações.
+    """
+    if not text or not text.strip():
+        return []
+
+    # Divide por quebras de linha ou pontuação final (. ! ?) seguida de espaço
+    sentence_pattern = _re.compile(r'(?<=[.!?])\s+|\n+')
+    raw_sentences = sentence_pattern.split(text.strip())
+    return [s.strip() for s in raw_sentences if s.strip()]
 
 
 def split_text_into_chunks(text: str, max_chars: int = _MAX_CHUNK_CHARS) -> List[str]:
@@ -614,37 +629,42 @@ class F5TTSEngine(BaseTTSEngine):
                 logger.error("Erro na inferência do F5-TTS: %s", e)
                 raise RuntimeError(f"Falha na inferência do F5-TTS: {e}") from e
 
-
     def _synthesize_long_text(
         self,
         text: str,
         reference_audio_path: str,
         output_path: str,
         reference_text: Optional[str] = None,
+        speed: float = 1.0,
+        sentence_pause_seconds: float = DEFAULT_SENTENCE_PAUSE_SECONDS,
     ) -> None:
         """
-        Sintetiza textos longos via chunking inteligente por sentenças.
-
-        Divide o texto em chunks de ~200 chars, sintetiza cada chunk
-        individualmente com _synthesize_raw, e concatena todos os WAVs
-        resultantes em um único arquivo de saída.
+        Sintetiza textos longos ou multi-sentenças via chunking inteligente.
+        Sintetiza cada sentença individualmente e concatena intercalando a pausa
+        natural configurada (respiro de estúdio) entre as frases.
         """
-        chunks = split_text_into_chunks(text, max_chars=_MAX_CHUNK_CHARS)
+        sentences = split_text_into_sentences(text)
+        chunks: List[str] = []
+        for s in sentences:
+            sub = split_text_into_chunks(s, max_chars=_MAX_CHUNK_CHARS)
+            chunks.extend(sub)
+
         total_chunks = len(chunks)
 
         if total_chunks <= 1:
-            # Texto curto — sintetiza diretamente
+            # Texto curto de uma única frase — sintetiza diretamente
             self._synthesize_raw(
                 text=text,
                 reference_audio_path=reference_audio_path,
                 raw_output_path=output_path,
                 reference_text=reference_text,
+                speed=speed,
             )
             return
 
         logger.info(
-            "Chunking ativado: texto de %d chars dividido em %d chunks (max %d chars/chunk)",
-            len(text), total_chunks, _MAX_CHUNK_CHARS,
+            "Chunking por sentenças ativado: %d sentenças/chunks (pausa entre frases: %.2fs)",
+            total_chunks, sentence_pause_seconds,
         )
 
         out_path = Path(output_path).resolve()
@@ -655,7 +675,7 @@ class F5TTSEngine(BaseTTSEngine):
             for i, chunk_text in enumerate(chunks, 1):
                 chunk_wav = str(out_path.parent / f"{out_path.stem}_chunk_{i:03d}.wav")
                 logger.debug(
-                    "  Chunk %d/%d (%d chars): '%s...'",
+                    "  Sentença %d/%d (%d chars): '%s...'",
                     i, total_chunks, len(chunk_text), chunk_text[:60],
                 )
                 self._synthesize_raw(
@@ -663,11 +683,12 @@ class F5TTSEngine(BaseTTSEngine):
                     reference_audio_path=reference_audio_path,
                     raw_output_path=chunk_wav,
                     reference_text=reference_text,
+                    speed=speed,
                 )
                 chunk_wav_files.append(chunk_wav)
 
-            # Concatena todos os chunks usando soundfile + numpy
-            self._concat_wav_files(chunk_wav_files, str(out_path))
+            # Concatena todos os chunks inserindo silêncio de respiro entre as sentenças
+            self._concat_wav_files(chunk_wav_files, str(out_path), pause_seconds=sentence_pause_seconds)
             logger.info(
                 "Chunking concluído: %d chunks concatenados em %s (%.1fs)",
                 total_chunks, out_path.name, get_audio_duration(str(out_path)),
@@ -683,10 +704,15 @@ class F5TTSEngine(BaseTTSEngine):
                         pass
 
     @staticmethod
-    def _concat_wav_files(wav_files: List[str], output_path: str) -> None:
+    def _concat_wav_files(
+        wav_files: List[str],
+        output_path: str,
+        pause_seconds: float = DEFAULT_SENTENCE_PAUSE_SECONDS,
+    ) -> None:
         """
         Concatena múltiplos arquivos WAV em um único arquivo de saída.
-        Usa numpy + soundfile para concatenação precisa sem recodificação.
+        Insere um silêncio acústico suave (pause_seconds) entre os blocos
+        para reproduzir fielmente os respiros contemplativos da voz original.
         """
         import numpy as np
 
@@ -709,6 +735,8 @@ class F5TTSEngine(BaseTTSEngine):
                     logger.warning(
                         "Sample rate diferente em chunk (%d vs %d). Usando o primeiro.", sr, target_sr
                     )
+                if data.ndim > 1:
+                    data = data.mean(axis=1)  # Converte stereo para mono
                 all_audio.append(data)
             except Exception as e:
                 logger.warning("Erro ao ler chunk WAV '%s': %s. Ignorando.", wf, e)
@@ -716,14 +744,17 @@ class F5TTSEngine(BaseTTSEngine):
         if not all_audio or target_sr is None:
             raise RuntimeError("Nenhum chunk de áudio válido para concatenar.")
 
-        # Garante que todos os arrays são mono (1D)
-        mono_arrays = []
-        for arr in all_audio:
-            if arr.ndim > 1:
-                arr = arr.mean(axis=1)  # Converte stereo para mono
-            mono_arrays.append(arr)
+        # Inserção da pausa de silêncio calibrada entre as sentenças
+        silence_samples = int(max(0.0, pause_seconds) * target_sr)
+        silence_gap = np.zeros(silence_samples, dtype=np.float32) if silence_samples > 0 else None
 
-        combined = np.concatenate(mono_arrays)
+        combined_parts = []
+        for i, arr in enumerate(all_audio):
+            combined_parts.append(arr)
+            if silence_gap is not None and i < len(all_audio) - 1:
+                combined_parts.append(silence_gap)
+
+        combined = np.concatenate(combined_parts)
         sf.write(output_path, combined, target_sr)
 
     def clone_and_synthesize(
@@ -734,11 +765,12 @@ class F5TTSEngine(BaseTTSEngine):
         target_duration: Optional[float] = None,
         reference_text: Optional[str] = None,
         auto_unload: bool = False,
-        speed: float = 1.4,
+        speed: float = 1.0,
+        sentence_pause_seconds: float = DEFAULT_SENTENCE_PAUSE_SECONDS,
     ) -> ClonedAudioSegment:
         """
-        Gera áudio no timbre da voz de referência a partir do texto traduzido.
-        Para textos longos (>300 chars), ativa chunking automático por sentenças.
+        Gera áudio no timbre da voz de referência a partir do texto.
+        Divide sentenças para injetar pausas naturais entre orações (respiro de estúdio).
         Ajusta a duração para caber no tempo de tela com FFmpeg atempo (Controle de Ritmo).
         """
         self.load_model()
@@ -746,18 +778,27 @@ class F5TTSEngine(BaseTTSEngine):
         final_out.parent.mkdir(parents=True, exist_ok=True)
 
         raw_temp_path = str(final_out.with_suffix(".raw.wav"))
-        use_chunking = len(text.strip()) > _LONG_TEXT_THRESHOLD
+        sentences = split_text_into_sentences(text.strip())
+        use_sentence_flow = len(sentences) > 1 or len(text.strip()) > _LONG_TEXT_THRESHOLD
 
         try:
-            # Delega o chunking ao F5-TTS que possui chunking interno com cross-fade.
-            # O parâmetro speed controla a taxa de fala nativa durante o Flow Matching.
-            self._synthesize_raw(
-                text=text.strip(),
-                reference_audio_path=reference_audio_path,
-                raw_output_path=raw_temp_path,
-                reference_text=reference_text,
-                speed=speed,
-            )
+            if use_sentence_flow:
+                self._synthesize_long_text(
+                    text=text.strip(),
+                    reference_audio_path=reference_audio_path,
+                    output_path=raw_temp_path,
+                    reference_text=reference_text,
+                    speed=speed,
+                    sentence_pause_seconds=sentence_pause_seconds,
+                )
+            else:
+                self._synthesize_raw(
+                    text=text.strip(),
+                    reference_audio_path=reference_audio_path,
+                    raw_output_path=raw_temp_path,
+                    reference_text=reference_text,
+                    speed=speed,
+                )
 
             actual_dur = get_audio_duration(raw_temp_path)
             target_dur = target_duration or actual_dur
@@ -773,15 +814,16 @@ class F5TTSEngine(BaseTTSEngine):
                     max_speed=self.rhythm_config.max_speed,
                 )
             else:
+                # Mantém o áudio bruto
                 shutil.copyfile(raw_temp_path, str(final_out))
 
             return ClonedAudioSegment(
                 id=0,
                 start=0.0,
-                end=target_dur,
+                end=actual_dur,
                 audio_path=str(final_out),
                 target_duration=target_dur,
-                actual_duration=actual_dur,
+                actual_duration=get_audio_duration(str(final_out)),
                 speed_factor=speed_factor,
             )
 

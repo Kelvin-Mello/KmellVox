@@ -26,6 +26,7 @@ audio_mastering:
   last_profile: "Padrao_KmellVox"
   last_speed: 1.0
   tempo_calibration: 1.35
+  sentence_pause: 0.80
   profiles:
     Padrao_KmellVox:
       name: "Padrão KmellVox (Recomendado)"

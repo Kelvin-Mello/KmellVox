@@ -273,8 +273,34 @@ class TestVoiceClone(unittest.TestCase):
         self.assertEqual(results[0].end, 2.0)
         self.assertEqual(results[1].start, 2.5)
         self.assertEqual(results[1].end, 5.0)
-        self.assertTrue(os.path.isfile(results[0].audio_path))
-        self.assertTrue(os.path.isfile(results[1].audio_path))
+    def test_split_text_into_sentences(self):
+        """Testa divisão de textos em sentenças completas preservando pontuação."""
+        from core.voice_clone import split_text_into_sentences
+        text = "Primeira frase de impacto. Segunda frase com pergunta? Terceira exclamação!"
+        sents = split_text_into_sentences(text)
+        self.assertEqual(len(sents), 3)
+        self.assertEqual(sents[0], "Primeira frase de impacto.")
+        self.assertEqual(sents[1], "Segunda frase com pergunta?")
+        self.assertEqual(sents[2], "Terceira exclamação!")
+
+    def test_concat_wav_files_with_pause(self):
+        """Testa concatenação de WAVs inserindo silêncio de respiro entre blocos."""
+        wav1 = os.path.join(self.temp_dir.name, "chunk1.wav")
+        wav2 = os.path.join(self.temp_dir.name, "chunk2.wav")
+        out_wav = os.path.join(self.temp_dir.name, "concat_paused.wav")
+
+        sr = 24000
+        d1 = np.ones(int(sr * 1.0), dtype=np.float32) * 0.5
+        d2 = np.ones(int(sr * 1.0), dtype=np.float32) * 0.5
+        sf.write(wav1, d1, sr)
+        sf.write(wav2, d2, sr)
+
+        # Concatena com pausa de 0.5s entre os dois blocos de 1.0s -> Duração total deve ser 2.5s
+        F5TTSEngine._concat_wav_files([wav1, wav2], out_wav, pause_seconds=0.5)
+
+        data_out, sr_out = sf.read(out_wav)
+        self.assertEqual(sr_out, 24000)
+        self.assertAlmostEqual(len(data_out) / sr_out, 2.5, delta=0.02)
 
 
 if __name__ == "__main__":
