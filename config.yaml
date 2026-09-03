@@ -25,12 +25,12 @@ ui:
 audio_mastering:
   last_profile: "Padrao_KmellVox"
   last_speed: 1.0
-  tempo_calibration: 1.22
+  tempo_calibration: 1.15
   sentence_pause: 0.80
   profiles:
     Padrao_KmellVox:
       name: "Padrão KmellVox (Recomendado)"
-      bass: 4.5
+      bass: 3.0
       treble: 2.0
       compression: 2.5
       loudness: -16.0

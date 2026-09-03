@@ -84,9 +84,7 @@ class TestVoiceClone(unittest.TestCase):
 
         self.assertEqual(factor, 1.35)
 
-    @patch("core.voice_clone.adjust_audio_duration_ffmpeg", return_value=1.0)
-    @patch("soundfile.write")
-    def test_f5_tts_engine_synthesis_and_vram_cleanup(self, mock_sf_write, mock_adjust):
+    def test_f5_tts_engine_synthesis_and_vram_cleanup(self):
         """Testa síntese e liberação de VRAM no F5TTSEngine quando o pacote está instalado."""
         prof_b = ModelProfile.from_profile("perfil_b")
         engine = F5TTSEngine(model_profile=prof_b, rhythm_config=RhythmControlConfig(max_speed=1.35))
@@ -110,10 +108,14 @@ class TestVoiceClone(unittest.TestCase):
         # F5-TTS instalado: sintetiza com _synthesize_raw mockado para não precisar dos pesos
         out_seg_wav = os.path.join(self.temp_dir.name, "f5_out.wav")
 
-        def _fake_raw(text, reference_audio_path, raw_output_path, reference_text=None):
+        def _fake_raw(text, reference_audio_path, raw_output_path, reference_text=None, **kwargs):
             import soundfile as sf_real
             import numpy as np
-            sf_real.write(raw_output_path, np.zeros(int(24000 * 2.5), dtype=np.float32), 24000)
+            sr = 24000
+            t = np.linspace(0, 2.5, int(sr * 2.5), dtype=np.float32)
+            # Gera tom de 200Hz com envelope para simular fala realista
+            signal = 0.1 * np.sin(2 * np.pi * 200 * t) * np.clip(t * 4, 0, 1).astype(np.float32)
+            sf_real.write(raw_output_path, signal, sr)
 
         with patch.object(engine, "_synthesize_raw", side_effect=_fake_raw):
             cloned = engine.clone_and_synthesize(

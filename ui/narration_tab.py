@@ -746,13 +746,13 @@ class NarrationTab(QWidget):
         self.lbl_lufs_val.setText(f"{lufs} LUFS")
 
     def _get_current_mastering_config(self) -> AudioMasteringConfig:
-        tempo_calib = 1.22
+        tempo_calib = 1.15
         try:
             cfg_p = _get_config_path()
             if cfg_p.exists():
                 with open(cfg_p, "r", encoding="utf-8") as f:
                     c = yaml.safe_load(f) or {}
-                tempo_calib = float(c.get("audio_mastering", {}).get("tempo_calibration", 1.22))
+                tempo_calib = float(c.get("audio_mastering", {}).get("tempo_calibration", 1.15))
         except Exception:
             pass
 
@@ -1190,6 +1190,20 @@ class NarrationTab(QWidget):
         self.queue_jobs[job_id] = job
         self._insert_job_row(job)
         self.log_signal.emit(f"Item adicionado à fila: {job_id} ({fmt.upper()}, {speed:.2f}x)")
+
+        # Aviso ao usuário quando a referência de voz é curta (< 8s)
+        # Referências de 10-15s fornecem melhor fidelidade de clonagem no F5-TTS
+        if ref_audio:
+            try:
+                from core.voice_clone import get_audio_duration
+                ref_dur = get_audio_duration(ref_audio)
+                if 0 < ref_dur < 8.0:
+                    self.log_signal.emit(
+                        f"⚠️ Referência de voz curta ({ref_dur:.1f}s). "
+                        f"Para melhor fidelidade de clonagem, use uma referência de 10-15 segundos."
+                    )
+            except Exception:
+                pass
 
     def _insert_job_row(self, job: NarrationJob) -> None:
         row = self.table_queue.rowCount()

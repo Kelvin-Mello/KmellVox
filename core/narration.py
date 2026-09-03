@@ -184,13 +184,14 @@ def list_preset_voices(
 @dataclass
 class AudioMasteringConfig:
     """Configuração de masterização de voz e dinâmica de estúdio."""
-    bass_gain_db: float = 4.5           # Realce de graves no peito (150Hz)
+    bass_gain_db: float = 3.0           # Realce de graves no peito (150Hz) — calibrado pela análise espectral
     treble_gain_db: float = 2.0         # Brilho e clareza vocal (3500Hz)
+    presence_gain_db: float = 1.5       # Presença vocal (2800Hz) — compensa centroide mais baixo do F5-TTS
     compressor_threshold: float = -18.0 # Nivelamento dinâmico em dB
     compressor_ratio: float = 2.5       # Razão de compressão
     target_lufs: float = -16.0          # Padrão de loudness da indústria (broadcast/streaming)
     speech_speed: float = 1.0           # Fator de velocidade selecionado na UI (0.7x a 2.0x)
-    tempo_calibration: float = 1.22     # Calibração acústica nativa para igualar 1.0x à cadência equilibrada da voz original
+    tempo_calibration: float = 1.15     # Calibração acústica nativa — compensado pelo trimming de silêncio inicial
     sentence_pause_seconds: float = 0.80 # Pausa natural e respiro entre frases completas (. ! ?)
     enabled: bool = True
 
@@ -202,8 +203,6 @@ class AudioMasteringConfig:
         # Time-stretching de estúdio via algoritmo WSOLA do FFmpeg:
         # Acelera a fala preservando 100% o pitch, a resolução harmônica
         # e a proporção de pausas naturais, sem comprimir ou distorcer a difusão da IA.
-        # Em 1.00x na UI, effective_speed = 1.00 * 1.35 = 1.35x, entregando exatamente
-        # a cadência rápida, enérgica e fluida da voz original sem lentidão.
         effective_speed = self.speech_speed * self.tempo_calibration
         if abs(effective_speed - 1.0) > 0.01:
             spd = max(0.5, min(2.0, effective_speed))
@@ -211,6 +210,7 @@ class AudioMasteringConfig:
 
         filters.extend([
             f"bass=g={self.bass_gain_db:.1f}:f=150:w=0.6",
+            f"equalizer=f=2800:t=q:w=1.5:g={self.presence_gain_db:.1f}",
             f"treble={self.treble_gain_db:.1f}:f=3500",
             f"acompressor=threshold={self.compressor_threshold:.1f}dB:ratio={self.compressor_ratio:.1f}:attack=20:release=250",
             f"loudnorm=I={self.target_lufs:.1f}:TP=-1.5:LRA=11",

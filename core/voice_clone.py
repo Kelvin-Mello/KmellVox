@@ -625,7 +625,7 @@ class F5TTSEngine(BaseTTSEngine):
                     file_wave=str(out),
                     nfe_step=32,
                     speed=speed,
-                    target_rms=0.15,
+                    target_rms=0.1,
                     cross_fade_duration=0.15,
                     cfg_strength=2.0,
                     sway_sampling_coef=-1,
@@ -812,18 +812,42 @@ class F5TTSEngine(BaseTTSEngine):
                     speed=speed,
                 )
 
-            # Adiciona cauda acústica de decaimento natural (250ms) ao final do áudio
-            # para assegurar que o decaimento vocal da última palavra nunca seja cortado
+            # Pós-processamento acústico do áudio bruto:
+            # 1. Remove silêncio morto no início (evita corte da primeira palavra pelo atempo)
+            # 2. Adiciona cauda de decaimento (250ms) no final (evita corte abrupto da última palavra)
             try:
                 import numpy as np
                 raw_data, raw_sr = sf.read(raw_temp_path, dtype="float32")
-                tail_pad = np.zeros(int(0.25 * raw_sr), dtype=np.float32)
                 if raw_data.ndim > 1:
                     raw_data = raw_data.mean(axis=1)
-                padded_raw = np.concatenate([raw_data, tail_pad])
-                sf.write(raw_temp_path, padded_raw, raw_sr)
+
+                # Trimming de silêncio inicial: detecta onde a fala realmente começa
+                _SILENCE_THRESHOLD = 0.005
+                _HEAD_MARGIN_SEC = 0.01  # 10ms de margem antes da primeira fala
+                _MIN_REMAINING_SEC = 0.1  # Garante pelo menos 100ms de áudio restante
+                trim_idx = 0
+                for idx in range(len(raw_data)):
+                    if abs(raw_data[idx]) > _SILENCE_THRESHOLD:
+                        trim_idx = idx
+                        break
+                margin_samples = int(_HEAD_MARGIN_SEC * raw_sr)
+                trim_start = max(0, trim_idx - margin_samples)
+                min_remaining = int(_MIN_REMAINING_SEC * raw_sr)
+                # Safety: só aplica trim se sobrar áudio suficiente
+                if trim_start > 0 and (len(raw_data) - trim_start) >= min_remaining:
+                    logger.debug(
+                        "Silêncio inicial removido: %d amostras (%.0f ms)",
+                        trim_start, 1000 * trim_start / raw_sr,
+                    )
+                    raw_data = raw_data[trim_start:]
+
+                # Tail padding: adiciona 250ms de silêncio suave no final
+                tail_pad = np.zeros(int(0.25 * raw_sr), dtype=np.float32)
+                raw_data = np.concatenate([raw_data, tail_pad])
+
+                sf.write(raw_temp_path, raw_data, raw_sr)
             except Exception as e:
-                logger.debug("Falha ao aplicar tail padding: %s", e)
+                logger.debug("Falha no pós-processamento acústico: %s", e)
 
             actual_dur = get_audio_duration(raw_temp_path)
             target_dur = target_duration or actual_dur
