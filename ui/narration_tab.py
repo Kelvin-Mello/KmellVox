@@ -746,13 +746,13 @@ class NarrationTab(QWidget):
         self.lbl_lufs_val.setText(f"{lufs} LUFS")
 
     def _get_current_mastering_config(self) -> AudioMasteringConfig:
-        tempo_calib = 1.35
+        tempo_calib = 1.22
         try:
             cfg_p = _get_config_path()
             if cfg_p.exists():
                 with open(cfg_p, "r", encoding="utf-8") as f:
                     c = yaml.safe_load(f) or {}
-                tempo_calib = float(c.get("audio_mastering", {}).get("tempo_calibration", 1.35))
+                tempo_calib = float(c.get("audio_mastering", {}).get("tempo_calibration", 1.22))
         except Exception:
             pass
 

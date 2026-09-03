@@ -190,7 +190,7 @@ class AudioMasteringConfig:
     compressor_ratio: float = 2.5       # Razão de compressão
     target_lufs: float = -16.0          # Padrão de loudness da indústria (broadcast/streaming)
     speech_speed: float = 1.0           # Fator de velocidade selecionado na UI (0.7x a 2.0x)
-    tempo_calibration: float = 1.35     # Calibração acústica nativa para igualar 1.0x à cadência da voz original
+    tempo_calibration: float = 1.22     # Calibração acústica nativa para igualar 1.0x à cadência equilibrada da voz original
     sentence_pause_seconds: float = 0.80 # Pausa natural e respiro entre frases completas (. ! ?)
     enabled: bool = True
 

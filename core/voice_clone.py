@@ -612,10 +612,16 @@ class F5TTSEngine(BaseTTSEngine):
                         except Exception:
                             pass
 
+                target_text = text.strip()
+                if target_text and not target_text.endswith((".", "!", "?", "...", ":")):
+                    target_text += "."
+                # Adiciona um espaço suave ao final para dar folga de frames ao Vocos e impedir corte da última palavra
+                target_text = target_text + " "
+
                 self._f5_instance.infer(
                     ref_file=prepared_ref,
                     ref_text=ref_txt,
-                    gen_text=text,
+                    gen_text=target_text,
                     file_wave=str(out),
                     nfe_step=32,
                     speed=speed,
@@ -778,13 +784,19 @@ class F5TTSEngine(BaseTTSEngine):
         final_out.parent.mkdir(parents=True, exist_ok=True)
 
         raw_temp_path = str(final_out.with_suffix(".raw.wav"))
-        sentences = split_text_into_sentences(text.strip())
-        use_sentence_flow = len(sentences) > 1 or len(text.strip()) > _LONG_TEXT_THRESHOLD
+        clean_text = text.strip()
+
+        # Garante que o texto termine com pontuação e espaço para dar folga acústica
+        # à última palavra, impedindo que o modelo corte o som abruptamente.
+        if clean_text and not clean_text.endswith((".", "!", "?", "...", ":")):
+            clean_text += "."
+
+        use_chunking = len(clean_text) > _LONG_TEXT_THRESHOLD
 
         try:
-            if use_sentence_flow:
+            if use_chunking:
                 self._synthesize_long_text(
-                    text=text.strip(),
+                    text=clean_text,
                     reference_audio_path=reference_audio_path,
                     output_path=raw_temp_path,
                     reference_text=reference_text,
@@ -793,12 +805,25 @@ class F5TTSEngine(BaseTTSEngine):
                 )
             else:
                 self._synthesize_raw(
-                    text=text.strip(),
+                    text=clean_text,
                     reference_audio_path=reference_audio_path,
                     raw_output_path=raw_temp_path,
                     reference_text=reference_text,
                     speed=speed,
                 )
+
+            # Adiciona cauda acústica de decaimento natural (250ms) ao final do áudio
+            # para assegurar que o decaimento vocal da última palavra nunca seja cortado
+            try:
+                import numpy as np
+                raw_data, raw_sr = sf.read(raw_temp_path, dtype="float32")
+                tail_pad = np.zeros(int(0.25 * raw_sr), dtype=np.float32)
+                if raw_data.ndim > 1:
+                    raw_data = raw_data.mean(axis=1)
+                padded_raw = np.concatenate([raw_data, tail_pad])
+                sf.write(raw_temp_path, padded_raw, raw_sr)
+            except Exception as e:
+                logger.debug("Falha ao aplicar tail padding: %s", e)
 
             actual_dur = get_audio_duration(raw_temp_path)
             target_dur = target_duration or actual_dur
