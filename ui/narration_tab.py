@@ -1,19 +1,26 @@
 """Aba de Geração de Narração em Áudio (PySide6).
 
 Permite sintetizar áudio a partir de texto puro ou legendas SRT,
-com suporte a clonagem de voz, presets, divisão de arquivos e gerenciamento de fila em lote.
+com controle de velocidade de fala, masterização vocal com perfis personalizados,
+gerenciamento completo de vozes clonadas e fila de processamento em lote.
 """
 
 from __future__ import annotations
 
+import gc
+import logging
 import os
+import re
+import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import QThread, Qt, Signal
+import yaml
+from PySide6.QtCore import QThread, QUrl, Qt, Signal
 from PySide6.QtGui import QFont
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -23,6 +30,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -30,20 +38,149 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QSlider,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from core.hardware import ModelProfile, detect_hardware
 from core.narration import (
+    AudioMasteringConfig,
     NarrationEngine,
     NarrationJob,
+    delete_saved_voice,
     detect_text_format,
+    get_voices_directory,
+    list_all_saved_voices,
     list_preset_voices,
+    rename_saved_voice,
+    save_cloned_voice,
 )
+
+logger = logging.getLogger("KmellVox.NarrationTab")
+
+
+def _get_config_path() -> Path:
+    """Retorna o caminho do config.yaml (funciona tanto dev quanto PyInstaller frozen)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent / "config.yaml"
+    return Path(__file__).parent.parent / "config.yaml"
+
+
+def _load_last_dir(key: str) -> str:
+    """Lê a última pasta salva para uma chave específica do config.yaml."""
+    try:
+        cfg_path = _get_config_path()
+        if cfg_path.exists():
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            val = cfg.get("ui", {}).get("last_dirs", {}).get(key, "")
+            if val and Path(val).is_dir():
+                return val
+    except Exception:
+        pass
+    return ""
+
+
+def _save_last_dir(key: str, folder: str) -> None:
+    """Persiste a última pasta usada para uma chave específica no config.yaml."""
+    try:
+        cfg_path = _get_config_path()
+        cfg: dict = {}
+        if cfg_path.exists():
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+        cfg.setdefault("ui", {}).setdefault("last_dirs", {})[key] = folder
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    except Exception:
+        pass
+
+
+def _load_mastering_profiles_from_config() -> Dict[str, dict]:
+    """Carrega perfis de masterização do config.yaml com fallback padrão."""
+    default_profiles = {
+        "Padrao_KmellVox": {
+            "name": "Padrão KmellVox (Recomendado)",
+            "bass": 4.5,
+            "treble": 2.0,
+            "compression": 2.5,
+            "loudness": -16.0,
+            "speed": 1.0,
+        },
+        "Podcast_Encorpado": {
+            "name": "Podcast / Narração Encorpada",
+            "bass": 6.0,
+            "treble": 2.5,
+            "compression": 3.0,
+            "loudness": -15.0,
+            "speed": 1.35,
+        },
+        "Clareza_Brilho": {
+            "name": "Clareza e Brilho",
+            "bass": 2.0,
+            "treble": 4.0,
+            "compression": 2.0,
+            "loudness": -16.0,
+            "speed": 1.45,
+        },
+        "Neutro": {
+            "name": "Neutro / Sem Efeitos",
+            "bass": 0.0,
+            "treble": 0.0,
+            "compression": 1.0,
+            "loudness": -16.0,
+            "speed": 1.0,
+        },
+    }
+    try:
+        cfg_path = _get_config_path()
+        if cfg_path.exists():
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            saved = cfg.get("audio_mastering", {}).get("profiles", {})
+            if isinstance(saved, dict) and saved:
+                default_profiles.update(saved)
+    except Exception as e:
+        logger.warning("Falha ao carregar perfis de masterização: %s", e)
+    return default_profiles
+
+
+def _save_mastering_profile_to_config(key: str, profile_data: dict) -> None:
+    """Salva um perfil de masterização no config.yaml."""
+    try:
+        cfg_path = _get_config_path()
+        cfg: dict = {}
+        if cfg_path.exists():
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            sec = cfg.setdefault("audio_mastering", {})
+            sec.setdefault("profiles", {})[key] = profile_data
+            sec["last_profile"] = key
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    except Exception as e:
+        logger.warning("Falha ao salvar perfil de masterização: %s", e)
+
+
+def _delete_mastering_profile_from_config(key: str) -> None:
+    """Remove um perfil personalizado de masterização do config.yaml."""
+    try:
+        cfg_path = _get_config_path()
+        if cfg_path.exists():
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            profiles = cfg.get("audio_mastering", {}).get("profiles", {})
+            if key in profiles:
+                del profiles[key]
+                with open(cfg_path, "w", encoding="utf-8") as f:
+                    yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    except Exception as e:
+        logger.warning("Falha ao excluir perfil de masterização: %s", e)
 
 
 class NarrationWorkerThread(QThread):
@@ -87,7 +224,7 @@ class NarrationWorkerThread(QThread):
 
 
 class NarrationTab(QWidget):
-    """Widget completo da aba de Narração de Texto e SRT."""
+    """Widget completo da aba de Narração de Texto e SRT reorganizado em sub-abas."""
 
     log_signal = Signal(str)
 
@@ -97,31 +234,81 @@ class NarrationTab(QWidget):
         self.queue_jobs: Dict[str, NarrationJob] = {}
         self.worker_thread: Optional[NarrationWorkerThread] = None
 
+        # Player de áudio integrado para preview de vozes
+        self.player = QMediaPlayer(self)
+        self.audio_output = QAudioOutput(self)
+        self.player.setAudioOutput(self.audio_output)
+        self.audio_output.setVolume(0.9)
+        self.playing_voice_path: Optional[str] = None
+
+        # Dicionário em memória dos perfis de masterização
+        self.mastering_profiles = _load_mastering_profiles_from_config()
+
         self._init_ui()
-        self._check_preset_voices()
+        self._refresh_all_voices()
+        self._load_last_used_profile()
 
     def _init_ui(self) -> None:
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(12, 12, 12, 12)
-        main_layout.setSpacing(10)
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(8, 8, 8, 8)
+        root_layout.setSpacing(6)
 
-        # Splitter horizontal: Formulário de Configuração (Esquerda) vs Fila de Narração (Direita)
+        # TabWidget Principal que divide Síntese vs Clonagem/Gerenciador
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet("""
+            QTabBar::tab {
+                font-weight: bold;
+                font-size: 13px;
+                padding: 8px 20px;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+            }
+            QTabBar::tab:selected {
+                background-color: #27272A;
+                color: #04D361;
+                border-bottom: 2px solid #04D361;
+            }
+            QTabBar::tab:!selected {
+                background-color: #18181B;
+                color: #A1A1AA;
+            }
+        """)
+
+        # Sub-aba 1: Síntese de Narração
+        self.tab_synthesis = QWidget()
+        self._build_synthesis_tab(self.tab_synthesis)
+        self.tabs.addTab(self.tab_synthesis, "🎙️ Síntese de Narração")
+
+        # Sub-aba 2: Clonagem e Gerenciamento de Vozes
+        self.tab_cloning = QWidget()
+        self._build_cloning_tab(self.tab_cloning)
+        self.tabs.addTab(self.tab_cloning, "🧬 Clonagem e Gerenciamento de Vozes")
+
+        root_layout.addWidget(self.tabs)
+
+    # -----------------------------------------------------------------------
+    # SUB-ABA 1: SÍNTESE DE NARRAÇÃO
+    # -----------------------------------------------------------------------
+
+    def _build_synthesis_tab(self, parent: QWidget) -> None:
+        layout = QVBoxLayout(parent)
+        layout.setContentsMargins(4, 8, 4, 4)
+
         splitter = QSplitter(Qt.Horizontal)
 
-        # -------------------------------------------------------------
-        # 1. Coluna Esquerda: Entrada de Texto, Voz e Configurações
-        # -------------------------------------------------------------
+        # -----------------------------
+        # Coluna Esquerda: Configuração
+        # -----------------------------
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(8)
 
-        # Grupo: Entrada de Texto / SRT
-        input_group = QGroupBox("Conteúdo de Origem (Texto ou Legenda SRT)")
+        # 1. Entrada de Texto / SRT
+        input_group = QGroupBox("1. Conteúdo de Origem (Texto ou Legenda SRT)")
         input_layout = QVBoxLayout(input_group)
-        input_layout.setSpacing(6)
+        input_layout.setSpacing(4)
 
-        # Barra de botões do input
         input_toolbar = QHBoxLayout()
         btn_import = QPushButton("📂 Importar Arquivo (.txt / .srt)")
         btn_import.setFixedHeight(28)
@@ -134,126 +321,210 @@ class NarrationTab(QWidget):
         input_toolbar.addWidget(btn_clear)
 
         input_toolbar.addStretch()
-
         self.lbl_format_detected = QLabel("📄 Formato detectado: Texto Puro (.txt)")
         self.lbl_format_detected.setStyleSheet("color: #04D361; font-weight: bold;")
         input_toolbar.addWidget(self.lbl_format_detected)
-
         input_layout.addLayout(input_toolbar)
 
-        # Caixa de texto
         self.txt_content = QPlainTextEdit()
         self.txt_content.setPlaceholderText(
-            "Cole aqui o seu texto puro para narração contínua ou o conteúdo de um arquivo de legendas .SRT "
-            "(com numeração e timestamps HH:MM:SS,mmm --> HH:MM:SS,mmm)..."
+            "Cole aqui o seu texto puro para narração contínua ou o conteúdo de um arquivo .SRT..."
         )
         self.txt_content.textChanged.connect(self._on_text_changed)
         input_layout.addWidget(self.txt_content)
-
         left_layout.addWidget(input_group)
 
-        # Grupo: Seleção de Voz (Clonagem vs Presets)
-        voice_group = QGroupBox("Seleção de Voz e Clonagem")
+        # 2. Seleção de Voz
+        voice_group = QGroupBox("2. Seleção da Voz Clonada")
         voice_layout = QVBoxLayout(voice_group)
         voice_layout.setSpacing(6)
 
-        # Opção 1: Clonar Voz
-        row_clone = QHBoxLayout()
-        self.rb_voice_clone = QRadioButton("Clonar Voz (Upload de Áudio de Referência):")
-        self.rb_voice_clone.setChecked(True)
-        self.rb_voice_clone.toggled.connect(self._on_voice_mode_changed)
-        row_clone.addWidget(self.rb_voice_clone)
+        row_voice = QHBoxLayout()
+        row_voice.addWidget(QLabel("Voz:"))
+        self.cb_synthesis_voices = QComboBox()
+        self.cb_synthesis_voices.setFixedHeight(30)
+        self.cb_synthesis_voices.setCursor(Qt.PointingHandCursor)
+        row_voice.addWidget(self.cb_synthesis_voices, stretch=3)
 
-        self.txt_ref_audio = QLineEdit()
-        self.txt_ref_audio.setPlaceholderText("Selecione um áudio de referência (.wav, .mp3, .flac)...")
-        row_clone.addWidget(self.txt_ref_audio)
+        btn_refresh_v = QPushButton("🔄")
+        btn_refresh_v.setToolTip("Atualizar lista de vozes")
+        btn_refresh_v.setFixedSize(30, 30)
+        btn_refresh_v.clicked.connect(self._refresh_all_voices)
+        row_voice.addWidget(btn_refresh_v)
 
-        self.btn_browse_ref = QPushButton("Procurar...")
-        self.btn_browse_ref.clicked.connect(self._browse_reference_audio)
-        row_clone.addWidget(self.btn_browse_ref)
-        voice_layout.addLayout(row_clone)
-
-        # Opção 2: Voz do Modelo (Preset)
-        self.row_preset_widget = QWidget()
-        row_preset = QHBoxLayout(self.row_preset_widget)
-        row_preset.setContentsMargins(0, 0, 0, 0)
-        self.rb_voice_preset = QRadioButton("Voz Padrão do Modelo (Preset):")
-        self.rb_voice_preset.toggled.connect(self._on_voice_mode_changed)
-        row_preset.addWidget(self.rb_voice_preset)
-
-        self.cb_preset_voices = QComboBox()
-        self.cb_preset_voices.setEnabled(False)
-        row_preset.addWidget(self.cb_preset_voices, stretch=1)
-        voice_layout.addWidget(self.row_preset_widget)
-
+        btn_go_clone = QPushButton("➕ Nova Voz...")
+        btn_go_clone.setToolTip("Abrir aba de clonagem para criar uma nova voz")
+        btn_go_clone.setFixedHeight(30)
+        btn_go_clone.clicked.connect(lambda: self.tabs.setCurrentIndex(1))
+        row_voice.addWidget(btn_go_clone)
+        voice_layout.addLayout(row_voice)
         left_layout.addWidget(voice_group)
 
-        # Grupo: Opções de Divisão SRT (Visível apenas para SRT)
-        self.grp_srt_options = QGroupBox("Opções de Divisão de Áudio (Exclusivo para SRT)")
+        # 3. Ritmo e Velocidade da Fala
+        speed_group = QGroupBox("3. Ritmo e Velocidade da Fala")
+        speed_layout = QVBoxLayout(speed_group)
+        speed_layout.setSpacing(4)
+
+        row_spd = QHBoxLayout()
+        row_spd.addWidget(QLabel("Velocidade:"))
+        self.slider_speed = QSlider(Qt.Horizontal)
+        self.slider_speed.setRange(70, 200)  # 0.70x a 2.00x
+        self.slider_speed.setValue(100)     # 1.00x padrão (Original / Calibrada)
+        self.slider_speed.setSingleStep(5)
+        self.slider_speed.valueChanged.connect(self._on_speed_slider_changed)
+        row_spd.addWidget(self.slider_speed, stretch=3)
+
+        self.lbl_speed_display = QLabel("1.00x (Original)")
+        self.lbl_speed_display.setStyleSheet("font-weight: bold; color: #04D361; min-width: 100px;")
+        row_spd.addWidget(self.lbl_speed_display)
+        speed_layout.addLayout(row_spd)
+
+        # Atalhos rápidos de velocidade
+        row_presets_spd = QHBoxLayout()
+        presets_list = [(0.85, "0.85x"), (1.0, "1.00x (Original)"), (1.15, "1.15x"), (1.30, "1.30x"), (1.50, "1.50x")]
+        for spd_val, spd_lbl in presets_list:
+            btn_spd = QPushButton(spd_lbl)
+            btn_spd.setFixedHeight(24)
+            btn_spd.setStyleSheet("font-size: 11px; padding: 2px 8px;")
+            btn_spd.clicked.connect(lambda _, v=int(spd_val * 100): self.slider_speed.setValue(v))
+            row_presets_spd.addWidget(btn_spd)
+        row_presets_spd.addStretch()
+        speed_layout.addLayout(row_presets_spd)
+        left_layout.addWidget(speed_group)
+
+        # 4. Masterização Vocal e Dinâmica de Estúdio
+        mast_group = QGroupBox("4. Masterização Vocal e Dinâmica de Estúdio")
+        mast_layout = QVBoxLayout(mast_group)
+        mast_layout.setSpacing(6)
+
+        # Linha de Perfis
+        row_prof = QHBoxLayout()
+        row_prof.addWidget(QLabel("Perfil:"))
+        self.cb_mastering_profiles = QComboBox()
+        self.cb_mastering_profiles.setFixedHeight(28)
+        self.cb_mastering_profiles.currentIndexChanged.connect(self._on_profile_selected)
+        row_prof.addWidget(self.cb_mastering_profiles, stretch=3)
+
+        btn_save_prof = QPushButton("💾 Salvar Perfil...")
+        btn_save_prof.setFixedHeight(28)
+        btn_save_prof.clicked.connect(self._save_custom_profile_dialog)
+        row_prof.addWidget(btn_save_prof)
+
+        btn_del_prof = QPushButton("🗑️")
+        btn_del_prof.setToolTip("Excluir perfil selecionado")
+        btn_del_prof.setFixedSize(28, 28)
+        btn_del_prof.clicked.connect(self._delete_custom_profile)
+        row_prof.addWidget(btn_del_prof)
+        mast_layout.addLayout(row_prof)
+
+        # Sliders de Ajuste Fino
+        grid_params = QHBoxLayout()
+
+        # Graves (Bass)
+        col_bass = QVBoxLayout()
+        col_bass.addWidget(QLabel("Graves (Warmth):"))
+        self.slider_bass = QSlider(Qt.Horizontal)
+        self.slider_bass.setRange(0, 120)  # 0.0 a 12.0 dB
+        self.slider_bass.setValue(45)     # 4.5 dB
+        self.slider_bass.valueChanged.connect(self._on_param_slider_changed)
+        col_bass.addWidget(self.slider_bass)
+        self.lbl_bass_val = QLabel("+4.5 dB")
+        col_bass.addWidget(self.lbl_bass_val)
+        grid_params.addLayout(col_bass)
+
+        # Agudos (Treble)
+        col_treb = QVBoxLayout()
+        col_treb.addWidget(QLabel("Agudos (Brilho):"))
+        self.slider_treble = QSlider(Qt.Horizontal)
+        self.slider_treble.setRange(0, 80)  # 0.0 a 8.0 dB
+        self.slider_treble.setValue(20)    # 2.0 dB
+        self.slider_treble.valueChanged.connect(self._on_param_slider_changed)
+        col_treb.addWidget(self.slider_treble)
+        self.lbl_treble_val = QLabel("+2.0 dB")
+        col_treb.addWidget(self.lbl_treble_val)
+        grid_params.addLayout(col_treb)
+
+        # Compressão
+        col_comp = QVBoxLayout()
+        col_comp.addWidget(QLabel("Compressão:"))
+        self.slider_comp = QSlider(Qt.Horizontal)
+        self.slider_comp.setRange(10, 50)  # 1.0 a 5.0 ratio
+        self.slider_comp.setValue(25)     # 2.5 ratio
+        self.slider_comp.valueChanged.connect(self._on_param_slider_changed)
+        col_comp.addWidget(self.slider_comp)
+        self.lbl_comp_val = QLabel("2.5:1")
+        col_comp.addWidget(self.lbl_comp_val)
+        grid_params.addLayout(col_comp)
+
+        # Loudness
+        col_lufs = QVBoxLayout()
+        col_lufs.addWidget(QLabel("Volume (LUFS):"))
+        self.slider_lufs = QSlider(Qt.Horizontal)
+        self.slider_lufs.setRange(-24, -12)  # -24 a -12 LUFS
+        self.slider_lufs.setValue(-16)       # -16 LUFS
+        self.slider_lufs.valueChanged.connect(self._on_param_slider_changed)
+        col_lufs.addWidget(self.slider_lufs)
+        self.lbl_lufs_val = QLabel("-16 LUFS")
+        col_lufs.addWidget(self.lbl_lufs_val)
+        grid_params.addLayout(col_lufs)
+
+        mast_layout.addLayout(grid_params)
+        left_layout.addWidget(mast_group)
+
+        # 5. Opções SRT e Destino
+        self.grp_srt_options = QGroupBox("Opções de Divisão (SRT)")
         srt_opt_layout = QVBoxLayout(self.grp_srt_options)
-        self.rb_srt_split = QRadioButton("Gerar um áudio separado por trecho (ex: 001_trecho.mp3, 002_...)")
-        self.rb_srt_single = QRadioButton("Juntar tudo em um único áudio no final (com pausas proporcionais do SRT)")
+        self.rb_srt_split = QRadioButton("Gerar áudios separados por trecho (ex: 001_trecho.mp3)")
+        self.rb_srt_single = QRadioButton("Juntar tudo em um único áudio contínuo (com pausas do SRT)")
         self.rb_srt_single.setChecked(True)
         srt_opt_layout.addWidget(self.rb_srt_split)
         srt_opt_layout.addWidget(self.rb_srt_single)
-        self.grp_srt_options.setVisible(False)  # Oculto por padrão até detectar SRT
+        self.grp_srt_options.setVisible(False)
         left_layout.addWidget(self.grp_srt_options)
 
-        # Grupo: Pasta de Destino
         dest_group = QGroupBox("Destino dos Arquivos de Áudio (MP3)")
         dest_layout = QVBoxLayout(dest_group)
-        dest_layout.setSpacing(6)
-
-        # Checkbox Salvar na pasta de origem
-        self.chk_save_source_dir = QCheckBox("Salvar na mesma pasta de origem do arquivo importado")
+        self.chk_save_source_dir = QCheckBox("Salvar na mesma pasta de origem do arquivo")
         self.chk_save_source_dir.setChecked(True)
-        self.chk_save_source_dir.setEnabled(False)  # Desabilitado até importar um arquivo real
+        self.chk_save_source_dir.setEnabled(False)
         self.chk_save_source_dir.toggled.connect(self._on_dest_mode_changed)
         dest_layout.addWidget(self.chk_save_source_dir)
 
-        # Linha de pasta personalizada
-        row_dest_folder = QHBoxLayout()
-        row_dest_folder.addWidget(QLabel("Pasta de Destino:"))
-        self.txt_dest_folder = QLineEdit()
-        self.txt_dest_folder.setText(str(Path.home() / "Downloads"))
-        self.txt_dest_folder.setEnabled(False)  # Desabilitado enquanto chk_save_source_dir estiver marcado
-        row_dest_folder.addWidget(self.txt_dest_folder)
-
+        row_dest = QHBoxLayout()
+        self.txt_dest_folder = QLineEdit(str(Path.home() / "Downloads"))
+        self.txt_dest_folder.setEnabled(False)
+        row_dest.addWidget(self.txt_dest_folder)
         self.btn_browse_dest = QPushButton("Procurar...")
         self.btn_browse_dest.setEnabled(False)
         self.btn_browse_dest.clicked.connect(self._browse_dest_folder)
-        row_dest_folder.addWidget(self.btn_browse_dest)
-        dest_layout.addLayout(row_dest_folder)
+        row_dest.addWidget(self.btn_browse_dest)
+        dest_layout.addLayout(row_dest)
 
-        # Checkbox subpasta Áudio
-        self.chk_audio_subfolder = QCheckBox("Criar subpasta 'Áudio' dentro do diretório de destino")
-        self.chk_audio_subfolder.setChecked(False)
+        self.chk_audio_subfolder = QCheckBox("Criar subpasta 'Áudio' dentro do destino")
         dest_layout.addWidget(self.chk_audio_subfolder)
-
         left_layout.addWidget(dest_group)
 
         # Botão Adicionar à Fila
         self.btn_add_to_queue = QPushButton("➕ Adicionar à Fila de Narração")
-        self.btn_add_to_queue.setStyleSheet("background-color: #8257E5; color: white; font-weight: bold; padding: 8px;")
+        self.btn_add_to_queue.setFixedHeight(38)
+        self.btn_add_to_queue.setStyleSheet("background-color: #8257E5; color: white; font-weight: bold;")
         self.btn_add_to_queue.clicked.connect(self._add_current_to_queue)
         left_layout.addWidget(self.btn_add_to_queue)
 
         splitter.addWidget(left_widget)
 
-        # -------------------------------------------------------------
-        # 2. Coluna Direita: Tabela de Fila e Controles de Execução
-        # -------------------------------------------------------------
+        # -----------------------------
+        # Coluna Direita: Fila e Execução
+        # -----------------------------
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(8)
 
-        # Barra de ferramentas da fila
         queue_tools = QHBoxLayout()
         self.lbl_queue_header = QLabel("Fila de Narrações (0 itens)")
         self.lbl_queue_header.setStyleSheet("font-weight: bold; color: #A8A8B3;")
         queue_tools.addWidget(self.lbl_queue_header)
-
         queue_tools.addStretch()
 
         btn_clear_done = QPushButton("🧹 Limpar Concluídos")
@@ -265,14 +536,13 @@ class NarrationTab(QWidget):
         btn_clear_queue.setFixedHeight(26)
         btn_clear_queue.clicked.connect(self._clear_all_jobs)
         queue_tools.addWidget(btn_clear_queue)
-
         right_layout.addLayout(queue_tools)
 
         # Tabela da fila
         self.table_queue = QTableWidget()
         self.table_queue.setColumnCount(6)
         self.table_queue.setHorizontalHeaderLabels([
-            "Origem", "Formato", "Modo Voz", "Status", "Progresso", "Ações"
+            "Origem", "Voz", "Velocidade", "Status", "Progresso", "Ações"
         ])
         self.table_queue.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table_queue.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -287,8 +557,6 @@ class NarrationTab(QWidget):
         # Painel de Progresso
         prog_box = QGroupBox("Status de Processamento")
         prog_box_layout = QVBoxLayout(prog_box)
-        prog_box_layout.setSpacing(4)
-
         self.lbl_job_stage = QLabel("Etapa Atual: Ocioso")
         self.lbl_job_stage.setStyleSheet("color: #04D361; font-weight: 500;")
         prog_box_layout.addWidget(self.lbl_job_stage)
@@ -298,7 +566,6 @@ class NarrationTab(QWidget):
         self.prog_bar.setValue(0)
         self.prog_bar.setFixedHeight(20)
         prog_box_layout.addWidget(self.prog_bar)
-
         right_layout.addWidget(prog_box)
 
         # Botões de Execução
@@ -313,30 +580,461 @@ class NarrationTab(QWidget):
         self.btn_cancel_queue.setFixedHeight(38)
         self.btn_cancel_queue.clicked.connect(self._cancel_queue_processing)
         exec_layout.addWidget(self.btn_cancel_queue, stretch=1)
-
         right_layout.addLayout(exec_layout)
-        splitter.addWidget(right_widget)
 
-        splitter.setSizes([520, 560])
-        main_layout.addWidget(splitter)
+        splitter.addWidget(right_widget)
+        splitter.setSizes([540, 560])
+        layout.addWidget(splitter)
+
+    # -----------------------------------------------------------------------
+    # SUB-ABA 2: CLONAGEM E GERENCIAMENTO DE VOZES
+    # -----------------------------------------------------------------------
+
+    def _build_cloning_tab(self, parent: QWidget) -> None:
+        layout = QVBoxLayout(parent)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+
+        # Bloco Superior: Clonar Nova Voz
+        clone_box = QGroupBox("🧬 Clonar e Adicionar Nova Voz")
+        clone_layout = QVBoxLayout(clone_box)
+        clone_layout.setSpacing(8)
+
+        row_file = QHBoxLayout()
+        row_file.addWidget(QLabel("Áudio de Referência:"))
+        self.txt_clone_file = QLineEdit()
+        self.txt_clone_file.setPlaceholderText("Selecione um arquivo de áudio da voz que deseja clonar (.wav, .mp3, .flac, .m4a)...")
+        row_file.addWidget(self.txt_clone_file)
+        btn_browse_clone = QPushButton("📁 Procurar Áudio...")
+        btn_browse_clone.clicked.connect(self._browse_clone_audio)
+        row_file.addWidget(btn_browse_clone)
+        clone_layout.addLayout(row_file)
+
+        row_meta = QHBoxLayout()
+        row_meta.addWidget(QLabel("Nome da Voz:"))
+        self.txt_clone_name = QLineEdit()
+        self.txt_clone_name.setPlaceholderText("Ex: Narrador Documentário, Voz Carlos, etc.")
+        row_meta.addWidget(self.txt_clone_name, stretch=2)
+
+        row_meta.addWidget(QLabel("Transcrição (Opcional):"))
+        self.txt_clone_transcription = QLineEdit()
+        self.txt_clone_transcription.setPlaceholderText("O que foi falado no áudio (se vazio, transcreve automaticamente)...")
+        row_meta.addWidget(self.txt_clone_transcription, stretch=3)
+        clone_layout.addLayout(row_meta)
+
+        lbl_hint = QLabel(
+            "💡 <b>Inteligência de Alinhamento KmellVox</b>: Para clonagem perfeita e com graves preservados, "
+            "o áudio é calibrado entre 5 e 12 segundos exatamente no final de uma frase com ponto final ou pausa, "
+            "sem cortar palavras ao meio."
+        )
+        lbl_hint.setStyleSheet("color: #A1A1AA; font-size: 11px;")
+        clone_layout.addWidget(lbl_hint)
+
+        row_btn_clone = QHBoxLayout()
+        row_btn_clone.addStretch()
+        self.btn_execute_clone = QPushButton("💾 Clonar e Salvar Voz no Sistema")
+        self.btn_execute_clone.setFixedHeight(34)
+        self.btn_execute_clone.setStyleSheet("background-color: #04D361; color: #121214; font-weight: bold; padding: 0 16px;")
+        self.btn_execute_clone.clicked.connect(self._save_new_cloned_voice)
+        row_btn_clone.addWidget(self.btn_execute_clone)
+        clone_layout.addLayout(row_btn_clone)
+        layout.addWidget(clone_box)
+
+        # Bloco Inferior: Gerenciador de Vozes Salvas
+        mgmt_box = QGroupBox("📚 Minhas Vozes Salvas (Voices)")
+        mgmt_layout = QVBoxLayout(mgmt_box)
+        mgmt_layout.setSpacing(6)
+
+        toolbar_mgmt = QHBoxLayout()
+        self.lbl_voices_count = QLabel("Vozes Salvas (0)")
+        self.lbl_voices_count.setStyleSheet("font-weight: bold; color: #A1A1AA;")
+        toolbar_mgmt.addWidget(self.lbl_voices_count)
+        toolbar_mgmt.addStretch()
+
+        self.lbl_player_status = QLabel("⏹️ Player Ocioso")
+        self.lbl_player_status.setStyleSheet("color: #04D361; font-weight: 500; margin-right: 12px;")
+        toolbar_mgmt.addWidget(self.lbl_player_status)
+
+        btn_stop_audio = QPushButton("⏹️ Parar Reprodução")
+        btn_stop_audio.clicked.connect(self._stop_preview)
+        toolbar_mgmt.addWidget(btn_stop_audio)
+
+        btn_open_folder = QPushButton("📁 Abrir Pasta de Vozes")
+        btn_open_folder.clicked.connect(self._open_voices_folder)
+        toolbar_mgmt.addWidget(btn_open_folder)
+
+        btn_refresh = QPushButton("🔄 Atualizar")
+        btn_refresh.clicked.connect(self._refresh_all_voices)
+        toolbar_mgmt.addWidget(btn_refresh)
+        mgmt_layout.addLayout(toolbar_mgmt)
+
+        # Tabela de Vozes
+        self.table_voices = QTableWidget()
+        self.table_voices.setColumnCount(5)
+        self.table_voices.setHorizontalHeaderLabels([
+            "Nome da Voz", "Duração", "Tamanho", "Data de Cadastro", "Ações"
+        ])
+        self.table_voices.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table_voices.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table_voices.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table_voices.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table_voices.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.table_voices.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table_voices.setAlternatingRowColors(True)
+        mgmt_layout.addWidget(self.table_voices)
+
+        layout.addWidget(mgmt_box)
+
+    # -----------------------------------------------------------------------
+    # CONTROLES DE VELOCIDADE E MASTERIZAÇÃO VOCAL
+    # -----------------------------------------------------------------------
+
+    def _on_speed_slider_changed(self, val: int) -> None:
+        spd = val / 100.0
+        if val == 100:
+            self.lbl_speed_display.setText("1.00x (Original)")
+        else:
+            self.lbl_speed_display.setText(f"{spd:.2f}x")
+
+    def _on_param_slider_changed(self) -> None:
+        bass = self.slider_bass.value() / 10.0
+        treble = self.slider_treble.value() / 10.0
+        comp = self.slider_comp.value() / 10.0
+        lufs = self.slider_lufs.value()
+
+        self.lbl_bass_val.setText(f"+{bass:.1f} dB")
+        self.lbl_treble_val.setText(f"+{treble:.1f} dB")
+        self.lbl_comp_val.setText(f"{comp:.1f}:1")
+        self.lbl_lufs_val.setText(f"{lufs} LUFS")
+
+    def _get_current_mastering_config(self) -> AudioMasteringConfig:
+        tempo_calib = 1.35
+        try:
+            cfg_p = _get_config_path()
+            if cfg_p.exists():
+                with open(cfg_p, "r", encoding="utf-8") as f:
+                    c = yaml.safe_load(f) or {}
+                tempo_calib = float(c.get("audio_mastering", {}).get("tempo_calibration", 1.35))
+        except Exception:
+            pass
+
+        return AudioMasteringConfig(
+            bass_gain_db=self.slider_bass.value() / 10.0,
+            treble_gain_db=self.slider_treble.value() / 10.0,
+            compressor_threshold=-18.0,
+            compressor_ratio=self.slider_comp.value() / 10.0,
+            target_lufs=float(self.slider_lufs.value()),
+            speech_speed=self.slider_speed.value() / 100.0,
+            tempo_calibration=tempo_calib,
+            enabled=True,
+        )
+
+    def _load_last_used_profile(self) -> None:
+        self.cb_mastering_profiles.clear()
+        for k, prof in self.mastering_profiles.items():
+            self.cb_mastering_profiles.addItem(prof.get("name", k), k)
+
+        # Seleciona o perfil padrão
+        idx = self.cb_mastering_profiles.findData("Padrao_KmellVox")
+        if idx >= 0:
+            self.cb_mastering_profiles.setCurrentIndex(idx)
+        elif self.cb_mastering_profiles.count() > 0:
+            self.cb_mastering_profiles.setCurrentIndex(0)
+
+    def _on_profile_selected(self, index: int) -> None:
+        key = self.cb_mastering_profiles.currentData()
+        if not key or key not in self.mastering_profiles:
+            return
+        p = self.mastering_profiles[key]
+
+        # Bloqueia sinais temporariamente para não disparar eventos circulares
+        self.slider_bass.blockSignals(True)
+        self.slider_treble.blockSignals(True)
+        self.slider_comp.blockSignals(True)
+        self.slider_lufs.blockSignals(True)
+        self.slider_speed.blockSignals(True)
+
+        self.slider_bass.setValue(int(p.get("bass", 4.5) * 10))
+        self.slider_treble.setValue(int(p.get("treble", 2.0) * 10))
+        self.slider_comp.setValue(int(p.get("compression", 2.5) * 10))
+        self.slider_lufs.setValue(int(p.get("loudness", -16.0)))
+        self.slider_speed.setValue(int(p.get("speed", 1.4) * 100))
+
+        self.slider_bass.blockSignals(False)
+        self.slider_treble.blockSignals(False)
+        self.slider_comp.blockSignals(False)
+        self.slider_lufs.blockSignals(False)
+        self.slider_speed.blockSignals(False)
+
+        self._on_param_slider_changed()
+        self._on_speed_slider_changed(self.slider_speed.value())
+
+    def _save_custom_profile_dialog(self) -> None:
+        name, ok = QInputDialog.getText(
+            self,
+            "Salvar Perfil de Áudio",
+            "Digite um nome para o novo perfil de masterização vocal:",
+        )
+        if not ok or not name.strip():
+            return
+
+        clean_name = name.strip()
+        key = re.sub(r'[^a-zA-Z0-9_]', '_', clean_name)
+        profile_data = {
+            "name": clean_name,
+            "bass": self.slider_bass.value() / 10.0,
+            "treble": self.slider_treble.value() / 10.0,
+            "compression": self.slider_comp.value() / 10.0,
+            "loudness": float(self.slider_lufs.value()),
+            "speed": self.slider_speed.value() / 100.0,
+        }
+        self.mastering_profiles[key] = profile_data
+        _save_mastering_profile_to_config(key, profile_data)
+
+        self.cb_mastering_profiles.addItem(clean_name, key)
+        self.cb_mastering_profiles.setCurrentIndex(self.cb_mastering_profiles.count() - 1)
+        QMessageBox.information(self, "Perfil Salvo", f"Perfil '{clean_name}' salvo com sucesso!")
+
+    def _delete_custom_profile(self) -> None:
+        key = self.cb_mastering_profiles.currentData()
+        if key in ("Padrao_KmellVox", "Neutro"):
+            QMessageBox.warning(self, "Perfil Padrão", "Os perfis padrão do sistema não podem ser excluídos.")
+            return
+
+        ans = QMessageBox.question(
+            self,
+            "Excluir Perfil",
+            f"Deseja realmente excluir o perfil '{self.cb_mastering_profiles.currentText()}'?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if ans == QMessageBox.Yes:
+            _delete_mastering_profile_from_config(key)
+            if key in self.mastering_profiles:
+                del self.mastering_profiles[key]
+            idx = self.cb_mastering_profiles.currentIndex()
+            self.cb_mastering_profiles.removeItem(idx)
+            self._on_profile_selected(0)
+
+    # -----------------------------------------------------------------------
+    # REPRODUÇÃO DE ÁUDIO PREVIEW (QMediaPlayer)
+    # -----------------------------------------------------------------------
+
+    def _play_preview(self, audio_path: str, voice_name: str) -> None:
+        if not os.path.isfile(audio_path):
+            QMessageBox.warning(self, "Arquivo Ausente", "Arquivo de áudio da voz não foi encontrado no disco.")
+            return
+
+        self.player.stop()
+        self.player.setSource(QUrl.fromLocalFile(audio_path))
+        self.player.play()
+        self.playing_voice_path = audio_path
+        self.lbl_player_status.setText(f"▶️ Reproduzindo: {voice_name}")
+
+    def _stop_preview(self) -> None:
+        self.player.stop()
+        self.playing_voice_path = None
+        self.lbl_player_status.setText("⏹️ Player Ocioso")
+
+    def _open_voices_folder(self) -> None:
+        voices_dir = get_voices_directory()
+        try:
+            os.startfile(str(voices_dir))
+        except Exception:
+            pass
+
+    # -----------------------------------------------------------------------
+    # GERENCIAMENTO DE VOZES (Sub-Aba 2)
+    # -----------------------------------------------------------------------
+
+    def _browse_clone_audio(self) -> None:
+        last = _load_last_dir("narration_ref_audio")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Selecionar Áudio de Referência para Clonagem",
+            last,
+            "Áudios Suportados (*.wav *.mp3 *.flac *.ogg *.m4a);;Todos (*.*)",
+        )
+        if path:
+            self.txt_clone_file.setText(path)
+            _save_last_dir("narration_ref_audio", str(Path(path).parent))
+            if not self.txt_clone_name.text().strip():
+                self.txt_clone_name.setText(Path(path).stem.replace("_", " ").title())
+
+    def _save_new_cloned_voice(self) -> None:
+        audio_p = self.txt_clone_file.text().strip()
+        name = self.txt_clone_name.text().strip()
+        transcription = self.txt_clone_transcription.text().strip()
+
+        if not audio_p or not os.path.isfile(audio_p):
+            QMessageBox.warning(self, "Áudio Inválido", "Selecione um arquivo de áudio válido para clonar a voz.")
+            return
+
+        if not name:
+            QMessageBox.warning(self, "Nome Ausente", "Digite um nome para identificar esta voz.")
+            return
+
+        try:
+            self.btn_execute_clone.setEnabled(False)
+            self.btn_execute_clone.setText("⏳ Processando e Calibrando...")
+
+            res = save_cloned_voice(
+                voice_name=name,
+                audio_path=audio_p,
+                transcript=transcription,
+            )
+
+            self.log_signal.emit(f"🧬 Nova voz clonada com alinhamento cirúrgico: '{res['name']}'")
+            self._refresh_all_voices()
+
+            # Limpa campos
+            self.txt_clone_file.clear()
+            self.txt_clone_name.clear()
+            self.txt_clone_transcription.clear()
+
+            QMessageBox.information(
+                self,
+                "Voz Clonada",
+                f"Voz '{res['name']}' clonada e calibrada com sucesso!\n"
+                "Ela já está pronta para seleção na aba de Síntese de Narração.",
+            )
+
+        except Exception as e:
+            QMessageBox.critical(self, "Erro ao Clonar Voz", f"Falha ao processar o áudio de referência:\n{e}")
+        finally:
+            self.btn_execute_clone.setEnabled(True)
+            self.btn_execute_clone.setText("💾 Clonar e Salvar Voz no Sistema")
 
     def _check_preset_voices(self) -> None:
-        """Verifica a presença de vozes pré-definidas e popula o combo ou oculta a opção."""
-        hw = detect_hardware()
-        presets = list_preset_voices(hw.model_profile)
+        """Compatibilidade com chamadas de atualização do MainWindow."""
+        self._refresh_all_voices()
 
-        self.cb_preset_voices.clear()
-        if presets:
-            for p in presets:
-                self.cb_preset_voices.addItem(p["label"], p["id"])
-            self.row_preset_widget.setVisible(True)
-        else:
-            # Se não houver presets prontos, oculta opção e mantém somente clonagem
-            self.row_preset_widget.setVisible(False)
-            self.rb_voice_clone.setChecked(True)
+    def _refresh_all_voices(self) -> None:
+        """Recarrega a lista de vozes da pasta voices/ e atualiza ambas as sub-abas."""
+        voices = list_all_saved_voices()
+
+        # 1. Atualiza ComboBox da Sub-Aba 1 (Síntese)
+        cur_selected = self.cb_synthesis_voices.currentData()
+        self.cb_synthesis_voices.clear()
+        for v in voices:
+            self.cb_synthesis_voices.addItem(f"🎙️ {v['display_name']} ({v['duration']:.1f}s)", v["audio_path"])
+
+        if cur_selected:
+            idx = self.cb_synthesis_voices.findData(cur_selected)
+            if idx >= 0:
+                self.cb_synthesis_voices.setCurrentIndex(idx)
+
+        # 2. Atualiza Tabela da Sub-Aba 2 (Gerenciador)
+        self.lbl_voices_count.setText(f"Vozes Salvas ({len(voices)})")
+        self.table_voices.setRowCount(0)
+
+        for row, v in enumerate(voices):
+            self.table_voices.insertRow(row)
+
+            # Nome
+            item_name = QTableWidgetItem(v["display_name"])
+            item_name.setToolTip(v["transcript"] if v["transcript"] else v["audio_path"])
+            self.table_voices.setItem(row, 0, item_name)
+
+            # Duração
+            item_dur = QTableWidgetItem(f"{v['duration']:.1f}s")
+            item_dur.setTextAlignment(Qt.AlignCenter)
+            self.table_voices.setItem(row, 1, item_dur)
+
+            # Tamanho
+            item_sz = QTableWidgetItem(f"{v['size_kb']} KB")
+            item_sz.setTextAlignment(Qt.AlignCenter)
+            self.table_voices.setItem(row, 2, item_sz)
+
+            # Data
+            item_dt = QTableWidgetItem(v["date_str"])
+            item_dt.setTextAlignment(Qt.AlignCenter)
+            self.table_voices.setItem(row, 3, item_dt)
+
+            # Ações
+            act_widget = QWidget()
+            act_layout = QHBoxLayout(act_widget)
+            act_layout.setContentsMargins(2, 2, 2, 2)
+            act_layout.setSpacing(4)
+
+            btn_play = QPushButton("▶️ Ouvir")
+            btn_play.setFixedHeight(24)
+            btn_play.setStyleSheet("font-size: 11px; padding: 2px 6px;")
+            btn_play.clicked.connect(lambda _, ap=v["audio_path"], vn=v["display_name"]: self._play_preview(ap, vn))
+            act_layout.addWidget(btn_play)
+
+            btn_ren = QPushButton("✏️")
+            btn_ren.setToolTip("Renomear voz")
+            btn_ren.setFixedSize(24, 24)
+            btn_ren.clicked.connect(lambda _, old_n=v["name"]: self._rename_voice_dialog(old_n))
+            act_layout.addWidget(btn_ren)
+
+            btn_upd = QPushButton("🔄")
+            btn_upd.setToolTip("Atualizar áudio de referência desta voz")
+            btn_upd.setFixedSize(24, 24)
+            btn_upd.clicked.connect(lambda _, vn=v["name"]: self._update_voice_sample(vn))
+            act_layout.addWidget(btn_upd)
+
+            btn_del = QPushButton("🗑️")
+            btn_del.setToolTip("Excluir esta voz permanentemente")
+            btn_del.setFixedSize(24, 24)
+            btn_del.setStyleSheet("color: #FF5555;")
+            btn_del.clicked.connect(lambda _, vn=v["name"]: self._delete_voice_dialog(vn))
+            act_layout.addWidget(btn_del)
+
+            self.table_voices.setCellWidget(row, 4, act_widget)
+
+    def _rename_voice_dialog(self, old_name: str) -> None:
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Renomear Voz",
+            f"Digite o novo nome para '{old_name}':",
+            text=old_name,
+        )
+        if ok and new_name.strip() and new_name.strip() != old_name:
+            if rename_saved_voice(old_name, new_name.strip()):
+                self._refresh_all_voices()
+                QMessageBox.information(self, "Voz Renomeada", f"Voz renomeada para '{new_name.strip()}'.")
+            else:
+                QMessageBox.warning(self, "Falha", "Não foi possível renomear a voz selecionada.")
+
+    def _update_voice_sample(self, voice_name: str) -> None:
+        last = _load_last_dir("narration_ref_audio")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            f"Atualizar Amostra de Áudio para '{voice_name}'",
+            last,
+            "Áudios Suportados (*.wav *.mp3 *.flac *.m4a);;Todos (*.*)",
+        )
+        if not path:
+            return
+
+        try:
+            save_cloned_voice(voice_name=voice_name, audio_path=path)
+            self._refresh_all_voices()
+            QMessageBox.information(self, "Amostra Atualizada", f"Áudio de referência da voz '{voice_name}' atualizado com sucesso!")
+        except Exception as e:
+            QMessageBox.critical(self, "Erro ao Atualizar", f"Falha ao atualizar o áudio:\n{e}")
+
+    def _delete_voice_dialog(self, voice_name: str) -> None:
+        ans = QMessageBox.question(
+            self,
+            "Excluir Voz",
+            f"Tem certeza que deseja excluir permanentemente a voz '{voice_name}' do sistema?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if ans == QMessageBox.Yes:
+            self._stop_preview()
+            if delete_saved_voice(voice_name):
+                self._refresh_all_voices()
+                QMessageBox.information(self, "Voz Excluída", f"Voz '{voice_name}' removida com sucesso.")
+            else:
+                QMessageBox.warning(self, "Falha", "Não foi possível remover o arquivo de voz.")
+
+    # -----------------------------------------------------------------------
+    # OPERAÇÕES DE NARRAÇÃO, FILA E EXECUÇÃO
+    # -----------------------------------------------------------------------
 
     def _on_text_changed(self) -> None:
-        """Atualiza a detecção de formato e visibilidade do grupo SRT em tempo real."""
         text = self.txt_content.toPlainText()
         fmt = detect_text_format(text)
         if fmt == "srt":
@@ -348,29 +1046,23 @@ class NarrationTab(QWidget):
             self.lbl_format_detected.setStyleSheet("color: #04D361; font-weight: bold;")
             self.grp_srt_options.setVisible(False)
 
-    def _on_voice_mode_changed(self) -> None:
-        """Alterna estado dos campos de clonagem vs preset."""
-        is_clone = self.rb_voice_clone.isChecked()
-        self.txt_ref_audio.setEnabled(is_clone)
-        self.btn_browse_ref.setEnabled(is_clone)
-        self.cb_preset_voices.setEnabled(not is_clone)
-
     def _on_dest_mode_changed(self) -> None:
-        """Controla a habilitação do campo de pasta personalizada."""
         save_source = self.chk_save_source_dir.isChecked() and self.chk_save_source_dir.isEnabled()
         self.txt_dest_folder.setEnabled(not save_source)
         self.btn_browse_dest.setEnabled(not save_source)
 
     def _import_file(self) -> None:
-        """Abre o diálogo de seleção de arquivo de texto ou legenda SRT."""
+        last = _load_last_dir("narration_source_file")
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Importar Arquivo para Narração",
-            "",
+            last,
             "Arquivos Suportados (*.txt *.srt);;Legendas SRT (*.srt);;Texto Puro (*.txt);;Todos (*.*)",
         )
         if not path:
             return
+
+        _save_last_dir("narration_source_file", str(Path(path).parent))
 
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -379,7 +1071,6 @@ class NarrationTab(QWidget):
             self.txt_content.setPlainText(content)
             self.current_source_file_path = path
 
-            # Habilita e marca checkbox de salvar na mesma pasta
             self.chk_save_source_dir.setEnabled(True)
             self.chk_save_source_dir.setChecked(True)
             self._on_dest_mode_changed()
@@ -389,52 +1080,51 @@ class NarrationTab(QWidget):
             QMessageBox.critical(self, "Erro ao Importar", f"Falha ao ler o arquivo selecionado:\n{e}")
 
     def _clear_input(self) -> None:
-        """Limpa a caixa de texto e redefine o caminho de arquivo."""
         self.txt_content.clear()
         self.current_source_file_path = None
         self.chk_save_source_dir.setChecked(False)
         self.chk_save_source_dir.setEnabled(False)
         self._on_dest_mode_changed()
 
-    def _browse_reference_audio(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Selecionar Áudio de Referência para Clonagem",
-            "",
-            "Áudios (*.wav *.mp3 *.flac *.ogg *.m4a);;Todos (*.*)",
-        )
-        if path:
-            self.txt_ref_audio.setText(path)
-
     def _browse_dest_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Selecionar Pasta de Destino")
+        last = _load_last_dir("narration_dest_folder")
+        folder = QFileDialog.getExistingDirectory(self, "Selecionar Pasta de Destino", last)
         if folder:
             self.txt_dest_folder.setText(folder)
+            _save_last_dir("narration_dest_folder", folder)
+
+    @property
+    def txt_ref_audio(self) -> QLineEdit:
+        """Propriedade de compatibilidade para código legado ou testes unitários."""
+        return self.txt_clone_file
 
     def _add_current_to_queue(self) -> None:
-        """Valida o formulário atual e adiciona um NarrationJob à fila."""
         text = self.txt_content.toPlainText().strip()
         if not text:
             QMessageBox.warning(self, "Texto Vazio", "Por favor, digite, cole ou importe um texto/SRT para narração.")
             return
 
+        ref_audio = self.cb_synthesis_voices.currentData()
+        if not ref_audio or not os.path.isfile(str(ref_audio)):
+            # Fallback para áudio de clonagem se preenchido (compatibilidade de automação e testes)
+            clone_audio = self.txt_clone_file.text().strip()
+            if clone_audio and os.path.isfile(clone_audio):
+                ref_audio = clone_audio
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Voz Não Selecionada",
+                    "Selecione uma voz clonada disponível ou clone uma nova voz na aba ao lado.",
+                )
+                return
+
         fmt = detect_text_format(text)
-        is_clone = self.rb_voice_clone.isChecked()
-        ref_audio = self.txt_ref_audio.text().strip() if is_clone else None
-
-        if is_clone and (not ref_audio or not os.path.isfile(ref_audio)):
-            QMessageBox.warning(
-                self,
-                "Áudio de Referência Ausente",
-                "Para clonar voz, selecione um arquivo de áudio de referência válido (.wav, .mp3).",
-            )
-            return
-
-        preset_id = self.cb_preset_voices.currentData() if not is_clone else None
         split_mode = "separado" if fmt == "srt" and self.rb_srt_split.isChecked() else "unico"
-
         save_source = self.chk_save_source_dir.isChecked() and self.chk_save_source_dir.isEnabled()
         dest_dir = self.txt_dest_folder.text().strip() or str(Path.home() / "Downloads")
+
+        speed = self.slider_speed.value() / 100.0
+        mastering_cfg = self._get_current_mastering_config()
 
         job_id = f"narr_job_{int(time.time() * 1000)}_{len(self.queue_jobs)}"
         job = NarrationJob(
@@ -442,10 +1132,11 @@ class NarrationTab(QWidget):
             source_text=text,
             source_format=fmt,
             source_file_path=self.current_source_file_path,
-            voice_mode="clone" if is_clone else "preset",
+            voice_mode="clone",
             reference_audio_path=ref_audio,
-            preset_voice_id=preset_id,
             split_mode=split_mode,
+            speech_speed=speed,
+            mastering_config=mastering_cfg,
             destination_folder=dest_dir,
             save_to_source_folder=save_source,
             create_audio_subfolder=self.chk_audio_subfolder.isChecked(),
@@ -453,53 +1144,57 @@ class NarrationTab(QWidget):
 
         self.queue_jobs[job_id] = job
         self._insert_job_row(job)
-        self.log_signal.emit(f"Item adicionado à fila de narração: {job_id} ({fmt.upper()})")
+        self.log_signal.emit(f"Item adicionado à fila: {job_id} ({fmt.upper()}, {speed:.2f}x)")
 
     def _insert_job_row(self, job: NarrationJob) -> None:
         row = self.table_queue.rowCount()
         self.table_queue.insertRow(row)
 
-        # 0. Origem
         origin_label = (
             os.path.basename(job.source_file_path)
             if job.source_file_path
-            else f"Texto ({len(job.source_text)} caracteres)"
+            else f"Texto ({len(job.source_text)} chars)"
         )
         item_orig = QTableWidgetItem(origin_label)
         item_orig.setData(Qt.UserRole, job.job_id)
         item_orig.setToolTip(job.source_text[:200] + "...")
         self.table_queue.setItem(row, 0, item_orig)
 
-        # 1. Formato
-        item_fmt = QTableWidgetItem(job.source_format.upper())
-        item_fmt.setTextAlignment(Qt.AlignCenter)
-        self.table_queue.setItem(row, 1, item_fmt)
-
-        # 2. Modo Voz
-        voice_str = "Clonagem" if job.voice_mode == "clone" else "Preset"
-        item_voice = QTableWidgetItem(voice_str)
+        # Voz
+        voice_label = Path(job.reference_audio_path).stem if job.reference_audio_path else "Padrão"
+        item_voice = QTableWidgetItem(voice_label.replace("_", " ").title())
         item_voice.setTextAlignment(Qt.AlignCenter)
-        self.table_queue.setItem(row, 2, item_voice)
+        self.table_queue.setItem(row, 1, item_voice)
 
-        # 3. Status
+        # Velocidade
+        item_spd = QTableWidgetItem(f"{job.speech_speed:.2f}x")
+        item_spd.setTextAlignment(Qt.AlignCenter)
+        self.table_queue.setItem(row, 2, item_spd)
+
+        # Status
         item_status = QTableWidgetItem("⏳ Pendente")
         item_status.setTextAlignment(Qt.AlignCenter)
         self.table_queue.setItem(row, 3, item_status)
 
-        # 4. Progresso
+        # Progresso
         prog = QProgressBar()
         prog.setRange(0, 100)
         prog.setValue(0)
-        prog.setFixedWidth(110)
+        prog.setFixedWidth(100)
         self.table_queue.setCellWidget(row, 4, prog)
 
-        # 5. Ações
+        # Ações
         actions_widget = QWidget()
         act_layout = QHBoxLayout(actions_widget)
         act_layout.setContentsMargins(2, 2, 2, 2)
-        btn_del = QPushButton("❌")
-        btn_del.setToolTip("Remover da Fila")
-        btn_del.setFixedSize(24, 24)
+        btn_del = QPushButton("Remover")
+        btn_del.setToolTip("Remover esta narração da fila")
+        btn_del.setFixedHeight(24)
+        btn_del.setStyleSheet(
+            "QPushButton { background-color: #3a3a40; color: #e0e0e0; border: 1px solid #555; "
+            "border-radius: 3px; padding: 2px 6px; font-size: 11px; } "
+            "QPushButton:hover { background-color: #e74c3c; color: white; }"
+        )
         btn_del.clicked.connect(lambda _, jid=job.job_id: self._remove_job(jid))
         act_layout.addWidget(btn_del)
         self.table_queue.setCellWidget(row, 5, actions_widget)
@@ -509,14 +1204,12 @@ class NarrationTab(QWidget):
     def _remove_job(self, job_id: str) -> None:
         if job_id not in self.queue_jobs:
             return
-
         del self.queue_jobs[job_id]
         for row in range(self.table_queue.rowCount()):
             item = self.table_queue.item(row, 0)
             if item and item.data(Qt.UserRole) == job_id:
                 self.table_queue.removeRow(row)
                 break
-
         self._update_queue_label()
 
     def _clear_completed_jobs(self) -> None:
@@ -525,7 +1218,7 @@ class NarrationTab(QWidget):
             self._remove_job(jid)
 
     def _clear_all_jobs(self) -> None:
-        pending_ids = [jid for jid, j in self.queue_jobs.items() if j.status != "Processando"]
+        pending_ids = [jid for jid, j in self.queue_jobs.items() if j.status != "Processando..."]
         for jid in pending_ids:
             self._remove_job(jid)
 
@@ -547,77 +1240,65 @@ class NarrationTab(QWidget):
 
         hw = detect_hardware()
         if getattr(sys, "frozen", False):
-            resolved_models_dir = str((Path(sys.executable).parent / "models").resolve())
+            models_dir = str((Path(sys.executable).parent / "models").resolve())
         else:
-            resolved_models_dir = str(Path("models").resolve())
+            models_dir = str((Path(__file__).parent.parent / "models").resolve())
 
         self.worker_thread = NarrationWorkerThread(
             jobs=pending,
             model_profile=hw.model_profile,
-            models_dir=resolved_models_dir,
+            models_dir=models_dir,
             parent=self,
         )
-        self.worker_thread.progress_signal.connect(self._on_worker_progress)
+        self.worker_thread.progress_signal.connect(self._on_job_progress)
         self.worker_thread.job_finished_signal.connect(self._on_job_finished)
         self.worker_thread.job_error_signal.connect(self._on_job_error)
         self.worker_thread.queue_completed_signal.connect(self._on_queue_completed)
+
+        for job in pending:
+            job.status = "Processando..."
+            self._update_job_row(job.job_id)
+
         self.worker_thread.start()
+        self.log_signal.emit(f"🚀 Fila iniciada com {len(pending)} tarefas.")
 
-    def _on_worker_progress(self, job_id: str, pct: float, msg: str) -> None:
-        if job_id in self.queue_jobs:
-            self.queue_jobs[job_id].status = "Processando"
-            self.queue_jobs[job_id].progress = pct
-
-        self.prog_bar.setValue(int(pct * 100))
-        self.lbl_job_stage.setText(f"Processando: {msg}")
-
+    def _update_job_row(self, job_id: str) -> None:
         for row in range(self.table_queue.rowCount()):
             item = self.table_queue.item(row, 0)
             if item and item.data(Qt.UserRole) == job_id:
-                st_item = self.table_queue.item(row, 3)
-                if st_item:
-                    st_item.setText("⚙️ Processando")
-                    st_item.setForeground(Qt.cyan)
-
-                prog_w = self.table_queue.cellWidget(row, 4)
-                if isinstance(prog_w, QProgressBar):
-                    prog_w.setValue(int(pct * 100))
+                job = self.queue_jobs[job_id]
+                status_item = self.table_queue.item(row, 3)
+                if status_item:
+                    status_item.setText(job.status)
+                cell_prog = self.table_queue.cellWidget(row, 4)
+                if isinstance(cell_prog, QProgressBar):
+                    cell_prog.setValue(int(job.progress * 100))
                 break
+
+    def _on_job_progress(self, job_id: str, pct: float, msg: str) -> None:
+        if job_id in self.queue_jobs:
+            self.queue_jobs[job_id].progress = pct
+            self.queue_jobs[job_id].status_message = msg
+            self._update_job_row(job_id)
+
+        self.prog_bar.setValue(int(pct * 100))
+        self.lbl_job_stage.setText(f"Etapa: {msg}")
 
     def _on_job_finished(self, job_id: str, outputs: list) -> None:
         if job_id in self.queue_jobs:
-            self.queue_jobs[job_id].status = "Concluído"
-            self.queue_jobs[job_id].output_files = outputs
+            job = self.queue_jobs[job_id]
+            job.status = "Concluído"
+            job.progress = 1.0
+            job.output_files = outputs
+            self._update_job_row(job_id)
 
-        for row in range(self.table_queue.rowCount()):
-            item = self.table_queue.item(row, 0)
-            if item and item.data(Qt.UserRole) == job_id:
-                st_item = self.table_queue.item(row, 3)
-                if st_item:
-                    st_item.setText("✅ Concluído")
-                    st_item.setForeground(Qt.green)
-
-                prog_w = self.table_queue.cellWidget(row, 4)
-                if isinstance(prog_w, QProgressBar):
-                    prog_w.setValue(100)
-                break
-
-        self.log_signal.emit(f"✅ Narração concluída: {len(outputs)} arquivo(s) gerado(s).")
+        self.log_signal.emit(f"✅ Tarefa {job_id} concluída. {len(outputs)} arquivo(s) gerado(s).")
 
     def _on_job_error(self, job_id: str, err: str) -> None:
         if job_id in self.queue_jobs:
-            self.queue_jobs[job_id].status = "Erro"
-            self.queue_jobs[job_id].status_message = err
-
-        for row in range(self.table_queue.rowCount()):
-            item = self.table_queue.item(row, 0)
-            if item and item.data(Qt.UserRole) == job_id:
-                st_item = self.table_queue.item(row, 3)
-                if st_item:
-                    st_item.setText("❌ Erro")
-                    st_item.setForeground(Qt.red)
-                    st_item.setToolTip(f"Erro:\n{err}")
-                break
+            job = self.queue_jobs[job_id]
+            job.status = f"Erro: {err[:25]}..."
+            self._update_job_row(job_id)
 
         self.lbl_job_stage.setText(f"❌ Erro na narração: {err}")
         self.log_signal.emit(f"❌ Erro na narração ({job_id}): {err}")
@@ -632,8 +1313,55 @@ class NarrationTab(QWidget):
         self.log_signal.emit("🏁 Fila de narração concluída.")
 
     def _cancel_queue_processing(self) -> None:
+        """Cancela a fila de narração imediatamente, interrompendo e descartando o áudio atual."""
         if self.worker_thread:
+            self.log_signal.emit("⏹️ Cancelando geração imediatamente...")
+            self.lbl_job_stage.setText("⏹️ Interrompendo geração...")
+
             self.worker_thread.cancel()
+
+            if self.worker_thread.isRunning():
+                logger.info("Encerrando thread de narração forçosamente (cancelamento imediato)...")
+                self.worker_thread.terminate()
+                self.worker_thread.wait(400)
+                self.log_signal.emit("⏹️ Thread interrompida imediatamente.")
+
+            self.worker_thread = None
+
+            for jid, job in self.queue_jobs.items():
+                if job.status in ("Pendente", "Processando..."):
+                    job.status = "Cancelado"
+                    self._update_job_row(jid)
+
+            self.btn_process_queue.setEnabled(True)
             self.btn_cancel_queue.setEnabled(False)
-            self.lbl_job_stage.setText("Cancelamento solicitado...")
-            self.log_signal.emit("Cancelamento da fila de narração solicitado.")
+            self.prog_bar.setValue(0)
+            self.lbl_job_stage.setText("⏹️ Processamento cancelado. Áudio parcial descartado.")
+            self._update_queue_label()
+            self.log_signal.emit("⏹️ Fila de narração cancelada e descartada.")
+
+            self._cleanup_torch()
+
+    def cleanup(self) -> None:
+        """Encerramento limpo: cancela threads, para reprodução e libera VRAM."""
+        self._stop_preview()
+        if self.worker_thread and self.worker_thread.isRunning():
+            logger.info("Encerrando thread de narração (cleanup)...")
+            self.worker_thread.cancel()
+            if not self.worker_thread.wait(1500):
+                self.worker_thread.terminate()
+                self.worker_thread.wait(500)
+            self.worker_thread = None
+
+        self._cleanup_torch()
+
+    @staticmethod
+    def _cleanup_torch() -> None:
+        """Libera VRAM e memória do PyTorch."""
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass

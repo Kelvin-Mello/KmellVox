@@ -102,9 +102,11 @@ class TestNarrationCoreAndUI(unittest.TestCase):
         (presets_dir / "voz_narrador.wav").write_bytes(b"dummy")
 
         voices = list_preset_voices(models_dir=self.temp_dir.name)
-        self.assertEqual(len(voices), 1)
-        self.assertEqual(voices[0]["id"], "voz_narrador")
-        self.assertIn("Voz Preset", voices[0]["label"])
+        matched = [v for v in voices if v["id"] == "voz_narrador"]
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(matched[0]["id"], "voz_narrador")
+        self.assertIn("Voz Preset", matched[0]["label"])
+
 
     def test_resolve_destination_folder(self):
         """Testa as regras de resolução de diretório de destino."""
@@ -211,7 +213,7 @@ class TestNarrationCoreAndUI(unittest.TestCase):
         """Testa geração de áudio único contínuo para SRT com inserção proporcional de silêncio."""
         mock_tts = MagicMock()
         mock_get_tts.return_value = mock_tts
-        mock_concat.side_effect = lambda pieces, out_mp3: out_mp3
+        mock_concat.side_effect = lambda pieces, out_mp3, *a, **kw: out_mp3
 
         engine = NarrationEngine()
         job = NarrationJob(

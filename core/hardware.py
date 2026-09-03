@@ -29,6 +29,16 @@ class HardwareProfile(str, enum.Enum):
     CPU = "cpu"                # Sem GPU CUDA ou VRAM < 5.0 GB
 
 
+# Mapa de nomes internos para nomes amigáveis exibidos na UI.
+# Os nomes internos ("perfil_a", "perfil_b", "cpu") permanecem inalterados no código e no config.yaml.
+PROFILE_DISPLAY_NAMES: Dict[str, str] = {
+    "perfil_a": "Alta Performance",
+    "perfil_b": "Otimizado",
+    "cpu": "CPU (Sem GPU)",
+}
+
+
+
 class WhisperModelVariant(str, enum.Enum):
     """Variantes válidas e homologadas do Faster-Whisper no KmellVox."""
     LARGE_V3 = "large-v3"               # Exclusivo de perfil_a
@@ -135,6 +145,11 @@ class ModelProfile:
     def to_dict(self) -> Dict[str, Any]:
         """Converte o perfil para um dicionário serializável."""
         return asdict(self)
+
+    @property
+    def display_name(self) -> str:
+        """Retorna o nome amigável do perfil para exibição na UI."""
+        return PROFILE_DISPLAY_NAMES.get(self.profile_name, self.profile_name)
 
 
 def resolve_profile_from_vram(cuda_available: bool, vram_gb: float) -> str:
@@ -398,7 +413,17 @@ def _query_nvidia_smi() -> Optional[Dict[str, Any]]:
             "--query-gpu=name,memory.total,memory.free,driver_version",
             "--format=csv,nounits,noheader"
         ]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+            creationflags=_NO_WINDOW,
+        )
         lines = [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
         if not lines:
             return None

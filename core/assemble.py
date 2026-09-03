@@ -86,8 +86,18 @@ def burn_subtitles(
     if progress_callback:
         progress_callback(0.20, "Codificando vídeo com legendas estampadas...")
 
+    _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+            creationflags=_NO_WINDOW,
+        )
         if progress_callback:
             progress_callback(1.0, "Legendas estampadas com sucesso.")
         return str(out)
@@ -144,8 +154,18 @@ def mux_audio_video(
     if progress_callback:
         progress_callback(0.30, "Substituindo faixa de áudio (muxing direto)...")
 
+    _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+            creationflags=_NO_WINDOW,
+        )
         if progress_callback:
             progress_callback(1.0, "Muxing concluído com sucesso.")
         return str(out)
@@ -197,8 +217,18 @@ def export_raw_package(
 
     logger.info("Exportando pacote bruto: MP3 (%s) e SRT (%s)...", out_mp3.name, out_srt.name)
 
+    _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+            creationflags=_NO_WINDOW,
+        )
     except subprocess.CalledProcessError as e:
         logger.error("Erro ao converter áudio para MP3 no pacote bruto: %s", e.stderr)
         raise RuntimeError(f"Falha ao gerar MP3 do pacote bruto: {e.stderr}") from e

@@ -9,6 +9,7 @@ Contém:
 from __future__ import annotations
 
 import abc
+import re as _re
 import gc
 import logging
 import os
@@ -17,6 +18,8 @@ import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
+
+from core.dependency_manager import ensure_addon_in_sys_path
 
 import soundfile as sf
 
@@ -134,8 +137,18 @@ def adjust_audio_duration_ffmpeg(
         current_duration, target_duration, speed_factor, filter_str
     )
 
+    _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+            creationflags=_NO_WINDOW,
+        )
         return speed_factor
     except subprocess.CalledProcessError as e:
         logger.warning("Falha ao ajustar atempo via FFmpeg: %s. Mantendo áudio original.", e.stderr)
@@ -188,6 +201,7 @@ class BaseTTSEngine(abc.ABC):
         target_duration: Optional[float] = None,
         reference_text: Optional[str] = None,
         auto_unload: bool = False,
+        speed: float = 1.4,
     ) -> ClonedAudioSegment:
         """Sintetiza um segmento de áudio clonando a voz de referência."""
         pass
@@ -252,6 +266,156 @@ class BaseTTSEngine(abc.ABC):
                 self.unload_model()
 
 
+# ---------------------------------------------------------------------------
+# Chunking inteligente para textos longos
+# ---------------------------------------------------------------------------
+
+# Limite máximo recomendado de caracteres por chunk para o F5-TTS.
+# O modelo foi treinado com janela de ~30 segundos (referência + gerado).
+# Textos com mais de ~300 chars por inferência geram áudio truncado/distorcido.
+_MAX_CHUNK_CHARS = 200
+_LONG_TEXT_THRESHOLD = 300  # Aciona chunking quando o texto excede este limite
+_MAX_REF_AUDIO_SECONDS = 15.0  # Limite máximo recomendado para áudio de referência no F5-TTS
+
+
+def split_text_into_chunks(text: str, max_chars: int = _MAX_CHUNK_CHARS) -> List[str]:
+    """
+    Divide um texto longo em chunks respeitando limites de sentenças.
+
+    Regras de divisão (em ordem de prioridade):
+    1. Quebra em pontos finais de sentença ('. ', '! ', '? ')
+    2. Se uma sentença individual exceder max_chars, quebra em vírgulas ou ponto-e-vírgulas
+    3. Como último recurso, quebra no espaço mais próximo do limite
+
+    Args:
+        text: Texto completo a ser dividido.
+        max_chars: Número máximo de caracteres por chunk (padrão: 200).
+
+    Returns:
+        Lista de chunks de texto, cada um com no máximo ~max_chars caracteres.
+    """
+    if not text or not text.strip():
+        return []
+
+    text = text.strip()
+
+    # Texto curto: retorna inteiro
+    if len(text) <= max_chars:
+        return [text]
+
+    # 1. Divide em sentenças (preserva o delimitador no final de cada sentença)
+    sentence_pattern = _re.compile(r'(?<=[.!?])\s+')
+    raw_sentences = sentence_pattern.split(text)
+
+    # Limpa e filtra sentenças vazias
+    sentences = [s.strip() for s in raw_sentences if s.strip()]
+
+    chunks: List[str] = []
+    current_chunk = ""
+
+    for sentence in sentences:
+        # Se a sentença sozinha cabe no chunk atual
+        candidate = (current_chunk + " " + sentence).strip() if current_chunk else sentence
+
+        if len(candidate) <= max_chars:
+            current_chunk = candidate
+        else:
+            # Salva o chunk atual (se tiver algo)
+            if current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = ""
+
+            # Se a sentença sozinha excede max_chars, precisa subdividir
+            if len(sentence) > max_chars:
+                # Tenta dividir por vírgulas ou ponto-e-vírgulas
+                sub_parts = _re.split(r'(?<=[,;])\s+', sentence)
+                for part in sub_parts:
+                    part = part.strip()
+                    if not part:
+                        continue
+                    sub_candidate = (current_chunk + " " + part).strip() if current_chunk else part
+                    if len(sub_candidate) <= max_chars:
+                        current_chunk = sub_candidate
+                    else:
+                        if current_chunk:
+                            chunks.append(current_chunk)
+                        # Se mesmo uma sub-parte excede, quebra por espaço
+                        if len(part) > max_chars:
+                            words = part.split()
+                            current_chunk = ""
+                            for word in words:
+                                word_candidate = (current_chunk + " " + word).strip() if current_chunk else word
+                                if len(word_candidate) <= max_chars:
+                                    current_chunk = word_candidate
+                                else:
+                                    if current_chunk:
+                                        chunks.append(current_chunk)
+                                    current_chunk = word
+                        else:
+                            current_chunk = part
+            else:
+                current_chunk = sentence
+
+    # Último chunk remanescente
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    # Pós-processamento: mescla chunks muito pequenos (<50 chars) com o seguinte
+    # Chunks minúsculos geram áudio de qualidade inferior no F5-TTS
+    _MIN_CHUNK_CHARS = 50
+    merged: List[str] = []
+    i = 0
+    while i < len(chunks):
+        c = chunks[i]
+        if len(c) < _MIN_CHUNK_CHARS and i + 1 < len(chunks):
+            # Mescla com o próximo se o resultado não ultrapassar max_chars * 1.3
+            combined = c + " " + chunks[i + 1]
+            if len(combined) <= int(max_chars * 1.3):
+                merged.append(combined)
+                i += 2
+                continue
+        merged.append(c)
+        i += 1
+
+    return merged
+
+
+def ensure_ffmpeg_in_path() -> None:
+    """Garante que tools/ffmpeg/bin esteja incluído no PATH e registrado para DLLs.
+
+    O torchcodec (dependência do F5-TTS >= 2.11) requer FFmpeg shared DLLs
+    acessíveis via os.add_dll_directory() no Windows.
+    """
+    import sys
+
+    # Candidatos para a pasta ffmpeg/bin
+    candidates = [
+        Path("tools/ffmpeg/bin"),
+        Path(__file__).parent.parent / "tools" / "ffmpeg" / "bin",
+    ]
+
+    # No executável congelado, adiciona o diretório ao lado do .exe
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).parent
+        candidates.insert(0, exe_dir / "tools" / "ffmpeg" / "bin")
+        candidates.insert(1, exe_dir / "_internal" / "tools" / "ffmpeg" / "bin")
+
+    for cand in candidates:
+        if cand.is_dir():
+            cand_str = str(cand.resolve())
+            if cand_str not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = cand_str + os.pathsep + os.environ.get("PATH", "")
+
+            # Registra para carga de DLLs (Windows 10+ / Python 3.8+)
+            # Necessário para torchcodec encontrar avcodec-*.dll etc.
+            if hasattr(os, "add_dll_directory"):
+                try:
+                    os.add_dll_directory(cand_str)
+                except OSError:
+                    pass
+            break
+
+
 class F5TTSEngine(BaseTTSEngine):
     """
     Motor padrão de clonagem de voz (F5-TTS).
@@ -268,25 +432,115 @@ class F5TTSEngine(BaseTTSEngine):
     ) -> None:
         super().__init__(model_profile=model_profile, device=device, models_dir=models_dir)
         self.rhythm_config = rhythm_config or RhythmControlConfig()
+        self._f5_instance = None
 
     def load_model(self) -> None:
-        """Carrega o modelo F5-TTS."""
-        if self.model is not None:
+        """Carrega o modelo F5-TTS com os pesos salvos localmente."""
+        if self._f5_instance is not None:
             return
 
-        logger.info("Carregando motor F5-TTS no dispositivo '%s'...", self.device)
+        ensure_ffmpeg_in_path()
+        ensure_addon_in_sys_path()
+
+        models_base = Path(self.models_dir)
+        ckpt_cand = models_base / "tts" / "f5-tts" / "F5TTS_v1_Base" / "model_1250000.safetensors"
+        vocab_cand = models_base / "tts" / "f5-tts" / "F5TTS_v1_Base" / "vocab.txt"
+
+        ckpt_file = str(ckpt_cand.resolve()) if ckpt_cand.is_file() else ""
+        vocab_file = str(vocab_cand.resolve()) if vocab_cand.is_file() else ""
+
+        target_device = self.device or "cuda"
+        logger.info("Carregando motor F5-TTS (dispositivo preferencial: '%s')...", target_device)
+
         try:
-            # Tenta importar API oficial do pacote f5-tts
-            from f5_tts.infer.utils_infer import load_model as f5_load_model
-            from f5_tts.model import DiT
-            self.model = "f5_loaded"
-            logger.info("Modelo F5-TTS carregado com sucesso.")
+            from f5_tts.api import F5TTS
+            try:
+                self._f5_instance = F5TTS(
+                    ckpt_file=ckpt_file,
+                    vocab_file=vocab_file,
+                    device=target_device,
+                )
+                logger.info("Modelo F5-TTS carregado com sucesso em '%s'.", target_device)
+            except Exception as e:
+                # Fallback para CPU se CUDA falhar (ex: incompatibilidade de kernels sm_120 no PyTorch cu124)
+                if target_device != "cpu" and ("no kernel image" in str(e) or "CUDA" in str(e)):
+                    logger.warning("Dispositivo CUDA indisponível para F5-TTS (%s). Alternando para CPU...", e)
+                    self._f5_instance = F5TTS(
+                        ckpt_file=ckpt_file,
+                        vocab_file=vocab_file,
+                        device="cpu",
+                    )
+                    logger.info("Modelo F5-TTS carregado com sucesso em modo CPU.")
+                else:
+                    raise
+
+            self.model = self._f5_instance
         except ImportError:
-            logger.warning(
-                "Pacote 'f5-tts' não encontrado no ambiente. "
-                "Operando em modo de compatibilidade/simulação para desenvolvimento."
+            logger.warning("Pacote 'f5-tts' não encontrado no ambiente.")
+            self.model = "f5_not_installed"
+            self._f5_instance = None
+
+    def _check_engine_available(self) -> None:
+        """Lança RuntimeError explicativo se o engine não está instalado."""
+        if self._f5_instance is None and self.model == "f5_not_installed":
+            raise RuntimeError(
+                "O pacote 'f5-tts' não está instalado neste ambiente.\n"
+                "Para gerar áudio real, instale as dependências pelo menu de configurações."
             )
-            self.model = "f5_mock"
+
+    def _prepare_reference_audio(self, reference_audio_path: str) -> str:
+        """
+        Prepara o áudio de referência para o F5-TTS, recortando para no máximo
+        _MAX_REF_AUDIO_SECONDS (15s) se necessário.
+
+        O F5-TTS foi treinado com janela de ~30 segundos (referência + gerado).
+        Áudios de referência > 20s degradam severamente a qualidade e velocidade.
+
+        Returns:
+            str: Caminho do áudio preparado (pode ser o original ou um recorte temporário).
+        """
+        duration = get_audio_duration(reference_audio_path)
+        if duration <= _MAX_REF_AUDIO_SECONDS:
+            return reference_audio_path
+
+        logger.warning(
+            "Áudio de referência muito longo (%.1fs > %.1fs). Recortando automaticamente.",
+            duration, _MAX_REF_AUDIO_SECONDS,
+        )
+
+        trimmed_path = Path(reference_audio_path).parent / f"_ref_trimmed_{Path(reference_audio_path).stem}.wav"
+        bin_path = resolve_ffmpeg_binary()
+
+        cmd = [
+            bin_path,
+            "-y",
+            "-i", str(Path(reference_audio_path).resolve()),
+            "-t", str(_MAX_REF_AUDIO_SECONDS),
+            "-ar", "24000",
+            "-ac", "1",
+            str(trimmed_path.resolve()),
+        ]
+
+        _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+                creationflags=_NO_WINDOW,
+            )
+            logger.info(
+                "Referência recortada: %.1fs -> %.1fs (%s)",
+                duration, _MAX_REF_AUDIO_SECONDS, trimmed_path.name,
+            )
+            return str(trimmed_path.resolve())
+        except subprocess.CalledProcessError as e:
+            logger.warning("Falha ao recortar referência: %s. Usando original.", e.stderr)
+            return reference_audio_path
 
     def _synthesize_raw(
         self,
@@ -294,43 +548,183 @@ class F5TTSEngine(BaseTTSEngine):
         reference_audio_path: str,
         raw_output_path: str,
         reference_text: Optional[str] = None,
+        target_duration: Optional[float] = None,
+        speed: float = 1.4,
     ) -> None:
-        """Executa a síntese direta de áudio sem pós-processamento de tempo."""
+        """Executa a síntese direta de áudio com controle nativo de velocidade."""
+        self._check_engine_available()
+        ensure_ffmpeg_in_path()
+
         out = Path(raw_output_path).resolve()
         out.parent.mkdir(parents=True, exist_ok=True)
 
-        if self.model == "f5_loaded":
+        # Recorta áudio de referência se exceder o limite do F5-TTS
+        prepared_ref = self._prepare_reference_audio(reference_audio_path)
+
+        if self._f5_instance is not None:
             try:
-                from f5_tts.infer.utils_infer import infer_process
-                # Executa inferência do F5-TTS
-                infer_process(
-                    ref_audio=reference_audio_path,
-                    ref_text=reference_text or "",
+                # Procura transcrição sidecar (.txt) se ref_text não foi fornecido
+                ref_txt = reference_text or ""
+                if not ref_txt:
+                    txt_sidecar = Path(reference_audio_path).with_suffix(".txt")
+                    if txt_sidecar.is_file():
+                        try:
+                            full_txt = txt_sidecar.read_text(encoding="utf-8").strip()
+                            # Se a referência foi recortada, recorta o texto de forma limpa
+                            ref_dur = get_audio_duration(reference_audio_path)
+                            if ref_dur > _MAX_REF_AUDIO_SECONDS and full_txt:
+                                ratio = _MAX_REF_AUDIO_SECONDS / max(ref_dur, 0.1)
+                                target_chars = int(len(full_txt) * ratio)
+                                cut_text = full_txt[:target_chars]
+                                last_period = cut_text.rfind(".")
+                                if last_period > len(cut_text) * 0.4:
+                                    ref_txt = cut_text[:last_period + 1].strip()
+                                else:
+                                    last_comma = cut_text.rfind(",")
+                                    if last_comma > len(cut_text) * 0.4:
+                                        ref_txt = cut_text[:last_comma].strip() + "."
+                                    else:
+                                        ref_txt = cut_text.strip()
+                                        if not ref_txt.endswith("."):
+                                            ref_txt += "."
+                                logger.info(
+                                    "Transcrição recortada alinhada: %d -> %d chars",
+                                    len(full_txt), len(ref_txt),
+                                )
+                            else:
+                                ref_txt = full_txt
+                            logger.info("Transcrição de referência carregada de %s", txt_sidecar.name)
+                        except Exception:
+                            pass
+
+                self._f5_instance.infer(
+                    ref_file=prepared_ref,
+                    ref_text=ref_txt,
                     gen_text=text,
-                    model_obj=self.model,
-                    output_file=str(out),
+                    file_wave=str(out),
+                    nfe_step=32,
+                    speed=speed,
+                    target_rms=0.15,
+                    cross_fade_duration=0.15,
+                    cfg_strength=2.0,
+                    sway_sampling_coef=-1,
                 )
                 return
             except Exception as e:
-                logger.error("Erro na inferência do F5-TTS: %s. Gerando áudio de fallback.", e)
+                logger.error("Erro na inferência do F5-TTS: %s", e)
+                raise RuntimeError(f"Falha na inferência do F5-TTS: {e}") from e
 
-        # Fallback / Simulação de desenvolvimento
-        ref_sr = 24000
-        ref_dur = 2.0
-        if os.path.isfile(reference_audio_path):
-            try:
-                ref_info = sf.info(reference_audio_path)
-                ref_sr = ref_info.samplerate
-                ref_dur = ref_info.duration
-            except Exception:
-                pass
 
-        # Cria áudio mono WAV placeholder com tamanho proporcional ao texto
+    def _synthesize_long_text(
+        self,
+        text: str,
+        reference_audio_path: str,
+        output_path: str,
+        reference_text: Optional[str] = None,
+    ) -> None:
+        """
+        Sintetiza textos longos via chunking inteligente por sentenças.
+
+        Divide o texto em chunks de ~200 chars, sintetiza cada chunk
+        individualmente com _synthesize_raw, e concatena todos os WAVs
+        resultantes em um único arquivo de saída.
+        """
+        chunks = split_text_into_chunks(text, max_chars=_MAX_CHUNK_CHARS)
+        total_chunks = len(chunks)
+
+        if total_chunks <= 1:
+            # Texto curto — sintetiza diretamente
+            self._synthesize_raw(
+                text=text,
+                reference_audio_path=reference_audio_path,
+                raw_output_path=output_path,
+                reference_text=reference_text,
+            )
+            return
+
+        logger.info(
+            "Chunking ativado: texto de %d chars dividido em %d chunks (max %d chars/chunk)",
+            len(text), total_chunks, _MAX_CHUNK_CHARS,
+        )
+
+        out_path = Path(output_path).resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        chunk_wav_files: List[str] = []
+
+        try:
+            for i, chunk_text in enumerate(chunks, 1):
+                chunk_wav = str(out_path.parent / f"{out_path.stem}_chunk_{i:03d}.wav")
+                logger.debug(
+                    "  Chunk %d/%d (%d chars): '%s...'",
+                    i, total_chunks, len(chunk_text), chunk_text[:60],
+                )
+                self._synthesize_raw(
+                    text=chunk_text,
+                    reference_audio_path=reference_audio_path,
+                    raw_output_path=chunk_wav,
+                    reference_text=reference_text,
+                )
+                chunk_wav_files.append(chunk_wav)
+
+            # Concatena todos os chunks usando soundfile + numpy
+            self._concat_wav_files(chunk_wav_files, str(out_path))
+            logger.info(
+                "Chunking concluído: %d chunks concatenados em %s (%.1fs)",
+                total_chunks, out_path.name, get_audio_duration(str(out_path)),
+            )
+
+        finally:
+            # Limpa arquivos temporários de chunks
+            for cf in chunk_wav_files:
+                if os.path.isfile(cf):
+                    try:
+                        os.remove(cf)
+                    except Exception:
+                        pass
+
+    @staticmethod
+    def _concat_wav_files(wav_files: List[str], output_path: str) -> None:
+        """
+        Concatena múltiplos arquivos WAV em um único arquivo de saída.
+        Usa numpy + soundfile para concatenação precisa sem recodificação.
+        """
         import numpy as np
-        est_duration = max(0.5, len(text.split()) * 0.35)
-        num_samples = int(ref_sr * est_duration)
-        samples = np.zeros(num_samples, dtype=np.float32)
-        sf.write(str(out), samples, ref_sr)
+
+        if not wav_files:
+            return
+        if len(wav_files) == 1:
+            shutil.copyfile(wav_files[0], output_path)
+            return
+
+        all_audio: List[Any] = []
+        target_sr: Optional[int] = None
+
+        for wf in wav_files:
+            try:
+                data, sr = sf.read(wf, dtype="float32")
+                if target_sr is None:
+                    target_sr = sr
+                elif sr != target_sr:
+                    # Resample simples se sample rates diferirem
+                    logger.warning(
+                        "Sample rate diferente em chunk (%d vs %d). Usando o primeiro.", sr, target_sr
+                    )
+                all_audio.append(data)
+            except Exception as e:
+                logger.warning("Erro ao ler chunk WAV '%s': %s. Ignorando.", wf, e)
+
+        if not all_audio or target_sr is None:
+            raise RuntimeError("Nenhum chunk de áudio válido para concatenar.")
+
+        # Garante que todos os arrays são mono (1D)
+        mono_arrays = []
+        for arr in all_audio:
+            if arr.ndim > 1:
+                arr = arr.mean(axis=1)  # Converte stereo para mono
+            mono_arrays.append(arr)
+
+        combined = np.concatenate(mono_arrays)
+        sf.write(output_path, combined, target_sr)
 
     def clone_and_synthesize(
         self,
@@ -340,31 +734,36 @@ class F5TTSEngine(BaseTTSEngine):
         target_duration: Optional[float] = None,
         reference_text: Optional[str] = None,
         auto_unload: bool = False,
+        speed: float = 1.4,
     ) -> ClonedAudioSegment:
         """
-        Gera áudio no timbre da voz de referência a partir do texto traduzido
-        e ajusta a duração para caber no tempo de tela com FFmpeg atempo (Controle de Ritmo).
+        Gera áudio no timbre da voz de referência a partir do texto traduzido.
+        Para textos longos (>300 chars), ativa chunking automático por sentenças.
+        Ajusta a duração para caber no tempo de tela com FFmpeg atempo (Controle de Ritmo).
         """
         self.load_model()
         final_out = Path(output_path).resolve()
         final_out.parent.mkdir(parents=True, exist_ok=True)
 
         raw_temp_path = str(final_out.with_suffix(".raw.wav"))
+        use_chunking = len(text.strip()) > _LONG_TEXT_THRESHOLD
 
         try:
-            # 1. Gera áudio no timbre original
+            # Delega o chunking ao F5-TTS que possui chunking interno com cross-fade.
+            # O parâmetro speed controla a taxa de fala nativa durante o Flow Matching.
             self._synthesize_raw(
-                text=text,
+                text=text.strip(),
                 reference_audio_path=reference_audio_path,
                 raw_output_path=raw_temp_path,
                 reference_text=reference_text,
+                speed=speed,
             )
 
             actual_dur = get_audio_duration(raw_temp_path)
             target_dur = target_duration or actual_dur
             speed_factor = 1.0
 
-            # 2. Ajuste de duração via FFmpeg atempo (Controle de Ritmo)
+            # Ajuste de duração via FFmpeg atempo (Controle de Ritmo)
             if target_duration and target_duration > 0:
                 speed_factor = adjust_audio_duration_ffmpeg(
                     input_audio=raw_temp_path,
@@ -425,17 +824,30 @@ class IndexTTS2Engine(BaseTTSEngine):
 
         logger.info("Carregando motor IndexTTS-2 (FP16) no dispositivo '%s'...", self.device)
         try:
-            # Tenta carregar do módulo index_tts se instalado/clonado
+            # Tenta carregar do módulo index_tts ou indextts se instalado/clonado
             import torch
-            from index_tts import IndexTTS
-            self.model = IndexTTS(device=self.device, use_fp16=True)
+            try:
+                from index_tts import IndexTTS
+                self.model = IndexTTS(device=self.device, use_fp16=True)
+            except ImportError:
+                import indextts
+                self.model = "indextts_loaded"
             logger.info("Modelo IndexTTS-2 carregado com sucesso em FP16.")
         except ImportError:
             logger.warning(
                 "Repositório/pacote 'index-tts' não encontrado no ambiente. "
-                "Operando em modo de compatibilidade/simulação para desenvolvimento."
+                "Instale via o README.md (requer clone do repositório IndexTTS-2 + dependências)."
             )
-            self.model = "indextts2_mock"
+            self.model = "indextts2_not_installed"
+
+    def _check_engine_available(self) -> None:
+        """Lança RuntimeError se o IndexTTS-2 não está instalado."""
+        if self.model == "indextts2_not_installed":
+            raise RuntimeError(
+                "O motor IndexTTS-2 não está instalado neste ambiente.\n"
+                "Para usar clônagem de voz, instale o IndexTTS-2 seguindo as instruções do README.md,\n"
+                "ou instale o F5-TTS (pip install f5-tts torch torchaudio) para o motor padrão."
+            )
 
     def clone_and_synthesize(
         self,
@@ -445,12 +857,15 @@ class IndexTTS2Engine(BaseTTSEngine):
         target_duration: Optional[float] = None,
         reference_text: Optional[str] = None,
         auto_unload: bool = False,
+        speed: float = 1.4,
     ) -> ClonedAudioSegment:
         """
         Sintetiza a fala clonada usando o modo de controle explícito de duração do IndexTTS-2,
         gerando o áudio já calibrado no tempo exato, sem necessidade de pós-processamento atempo.
         """
         self.load_model()
+        self._check_engine_available()
+
         final_out = Path(output_path).resolve()
         final_out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -467,19 +882,12 @@ class IndexTTS2Engine(BaseTTSEngine):
                     ref_text=reference_text,
                 )
             else:
-                # Simulação de desenvolvimento
-                ref_sr = 24000
-                if os.path.isfile(reference_audio_path):
-                    try:
-                        ref_info = sf.info(reference_audio_path)
-                        ref_sr = ref_info.samplerate
-                    except Exception:
-                        pass
-
-                import numpy as np
-                num_samples = int(ref_sr * target_dur)
-                samples = np.zeros(num_samples, dtype=np.float32)
-                sf.write(str(final_out), samples, ref_sr)
+                # IndexTTS-2 instalado mas sem synthesize_with_duration — tenta inferência padrão
+                self.model.infer(
+                    audio_prompt=reference_audio_path,
+                    text=text,
+                    output_path=str(final_out),
+                )
 
             actual_dur = get_audio_duration(str(final_out))
 
@@ -490,7 +898,7 @@ class IndexTTS2Engine(BaseTTSEngine):
                 audio_path=str(final_out),
                 target_duration=target_dur,
                 actual_duration=actual_dur,
-                speed_factor=1.0,  # Não usou atempo; gerado nativamente no tempo correto
+                speed_factor=1.0,
             )
 
         finally:
@@ -504,12 +912,13 @@ def get_tts_engine(
     **kwargs: Any,
 ) -> BaseTTSEngine:
     """
-    Factory que retorna a engine de síntese e clonagem de voz adequada.
+    Factory que retorna a engine de síntese e clonagem de voz adequada,
+    com fallback automático caso o motor preferido não esteja instalado.
     
-    Regras:
-        - use_advanced=True e perfil_a (8GB+): Retorna IndexTTS2Engine.
-        - use_advanced=True em perfil_b / cpu: Emite aviso e retorna F5TTSEngine.
-        - use_advanced=False: Retorna F5TTSEngine (padrão universal).
+    Cadeia de resolução:
+        1. use_advanced=True + perfil_a → IndexTTS2Engine (se instalado)
+        2. Fallback → F5TTSEngine (se instalado)
+        3. Nenhum instalado → RuntimeError com instruções de instalação
         
     Args:
         model_profile: Perfil de hardware detectado (se None, detecta automaticamente).
@@ -518,23 +927,47 @@ def get_tts_engine(
         
     Returns:
         BaseTTSEngine: Instância de F5TTSEngine ou IndexTTS2Engine.
+        
+    Raises:
+        RuntimeError: Se nenhum motor TTS estiver instalado no ambiente.
     """
+    # Garante que o python_env (instalado após boot) esteja no sys.path e DLLs registradas
+    ensure_addon_in_sys_path()
+
     profile = model_profile or ModelProfile.from_profile()
 
-    if use_advanced:
-        if profile.enable_indextts_2:
-            logger.info("Selecionando motor avançado de alta fidelidade: IndexTTS2Engine (perfil_a).")
-            return IndexTTS2Engine(model_profile=profile, **kwargs)
-        else:
-            logger.warning(
-                "⚠️ O motor avançado IndexTTS-2 requer no mínimo 8GB de VRAM (perfil_a). "
-                "Seu perfil atual é '%s'. Utilizando motor padrão F5TTSEngine com controle de ritmo.",
-                profile.profile_name,
-            )
-            return F5TTSEngine(model_profile=profile, **kwargs)
+    # --- Tenta o motor avançado IndexTTS-2 (perfil_a com 8GB+) ---
+    if use_advanced and profile.enable_indextts_2:
+        logger.info("Tentando inicializar motor avançado IndexTTS2Engine (perfil_a)...")
+        try:
+            engine = IndexTTS2Engine(model_profile=profile, **kwargs)
+            engine.load_model()
+            if engine.model and engine.model != "indextts2_not_installed" and not isinstance(engine.model, str):
+                return engine
+        except Exception as e:
+            logger.warning("IndexTTS-2 indisponível (%s). Utilizando motor padrão F5TTSEngine.", e)
 
-    logger.info("Selecionando motor padrão: F5TTSEngine (Perfil: %s).", profile.profile_name)
-    return F5TTSEngine(model_profile=profile, **kwargs)
+    # --- Tenta o motor padrão F5-TTS ---
+    logger.info("Selecionando motor de clonagem: F5TTSEngine (Perfil: %s).", profile.profile_name)
+    engine = F5TTSEngine(model_profile=profile, **kwargs)
+    engine.load_model()
+    if engine.model != "f5_not_installed":
+        return engine
+
+
+    # --- Nenhum motor disponível ---
+    raise RuntimeError(
+        "Nenhum motor de síntese de voz (TTS) está instalado neste ambiente.\n\n"
+        "Para gerar áudio com clonagem de voz, instale pelo menos um dos seguintes:\n\n"
+        "  Opção 1 — F5-TTS (recomendado para começar):\n"
+        "    pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124\n"
+        "    pip install f5-tts\n\n"
+        "  Opção 2 — IndexTTS-2 (alta qualidade, requer 8GB+ VRAM):\n"
+        "    Consulte o README.md para instruções de instalação do IndexTTS-2.\n\n"
+        "  Ou instale todas as dependências de GPU de uma vez:\n"
+        "    pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124\n"
+        "    pip install -r requirements-gpu.txt"
+    )
 
 
 # Alias para retrocompatibilidade

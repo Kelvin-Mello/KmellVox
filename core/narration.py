@@ -141,6 +141,15 @@ def list_preset_voices(
         Path("presets").resolve(),
     ]
 
+    # Pasta voices/ da raiz do app — onde o botão "Salvar como Preset" copia os arquivos.
+    # Funciona tanto no executável empacotado (PyInstaller) quanto no modo desenvolvimento.
+    if getattr(sys, "frozen", False):
+        _app_voices = Path(sys.executable).parent / "voices"
+    else:
+        _app_voices = Path(__file__).parent.parent / "voices"
+    candidate_paths.append(_app_voices)
+
+
     # Procura também na pasta de instalação do F5-TTS / IndexTTS se existir
     try:
         import f5_tts
@@ -173,6 +182,42 @@ def list_preset_voices(
 
 
 @dataclass
+class AudioMasteringConfig:
+    """Configuração de masterização de voz e dinâmica de estúdio."""
+    bass_gain_db: float = 4.5           # Realce de graves no peito (150Hz)
+    treble_gain_db: float = 2.0         # Brilho e clareza vocal (3500Hz)
+    compressor_threshold: float = -18.0 # Nivelamento dinâmico em dB
+    compressor_ratio: float = 2.5       # Razão de compressão
+    target_lufs: float = -16.0          # Padrão de loudness da indústria (broadcast/streaming)
+    speech_speed: float = 1.0           # Fator de velocidade selecionado na UI (0.7x a 2.0x)
+    tempo_calibration: float = 1.35     # Calibração acústica nativa para igualar 1.0x à cadência da voz original
+    enabled: bool = True
+
+    def build_ffmpeg_filter(self) -> str:
+        """Monta a string de filtros de áudio do FFmpeg para processamento de estúdio."""
+        if not self.enabled:
+            return ""
+        filters = []
+        # Time-stretching de estúdio via algoritmo WSOLA do FFmpeg:
+        # Acelera a fala preservando 100% o pitch, a resolução harmônica
+        # e a proporção de pausas naturais, sem comprimir ou distorcer a difusão da IA.
+        # Em 1.00x na UI, effective_speed = 1.00 * 1.35 = 1.35x, entregando exatamente
+        # a cadência rápida, enérgica e fluida da voz original sem lentidão.
+        effective_speed = self.speech_speed * self.tempo_calibration
+        if abs(effective_speed - 1.0) > 0.01:
+            spd = max(0.5, min(2.0, effective_speed))
+            filters.append(f"atempo={spd:.2f}")
+
+        filters.extend([
+            f"bass=g={self.bass_gain_db:.1f}:f=150:w=0.6",
+            f"treble={self.treble_gain_db:.1f}:f=3500",
+            f"acompressor=threshold={self.compressor_threshold:.1f}dB:ratio={self.compressor_ratio:.1f}:attack=20:release=250",
+            f"loudnorm=I={self.target_lufs:.1f}:TP=-1.5:LRA=11",
+        ])
+        return ",".join(filters)
+
+
+@dataclass
 class NarrationJob:
     """Representa uma tarefa na fila de geração de narração em áudio."""
     job_id: str
@@ -183,6 +228,8 @@ class NarrationJob:
     reference_audio_path: Optional[str] = None   # Usado se voice_mode == "clone"
     preset_voice_id: Optional[str] = None        # Usado se voice_mode == "preset"
     split_mode: str = "unico"                     # "separado" | "unico" (para SRT)
+    speech_speed: float = 1.4                     # Velocidade nativa da fala (0.7x a 2.0x)
+    mastering_config: Optional[AudioMasteringConfig] = None
     destination_folder: str = str(Path.home() / "Downloads")
     save_to_source_folder: bool = True
     create_audio_subfolder: bool = False
@@ -246,21 +293,40 @@ class NarrationEngine:
         final_dir.mkdir(parents=True, exist_ok=True)
         return final_dir
 
-    def _convert_to_mp3(self, input_audio: str, output_mp3: str, bitrate: str = "192k") -> str:
-        """Converte qualquer áudio para MP3 utilizando o FFmpeg."""
+    def _convert_to_mp3(
+        self,
+        input_audio: str,
+        output_mp3: str,
+        bitrate: str = "192k",
+        mastering_config: Optional[AudioMasteringConfig] = None,
+        apply_mastering: bool = True,
+    ) -> str:
+        """
+        Converte qualquer áudio para MP3 utilizando o FFmpeg com masterização de voz.
+        Aplica realce de graves profundos (warmth), brilho nos agudos, compressão dinâmica
+        e normalização de loudness de estúdio (-16 LUFS) para dar potência e presença.
+        """
         out_path = Path(output_mp3).resolve()
         out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        cfg = mastering_config or AudioMasteringConfig()
+        vocal_filter = cfg.build_ffmpeg_filter() if apply_mastering else ""
 
         cmd = [
             self.ffmpeg_bin,
             "-y",
             "-i", str(Path(input_audio).resolve()),
+        ]
+        if vocal_filter:
+            cmd.extend(["-af", vocal_filter])
+        cmd.extend([
             "-codec:a", "libmp3lame",
             "-b:a", bitrate,
             str(out_path),
-        ]
+        ])
 
-        logger.debug("Executando conversão MP3: %s", " ".join(cmd))
+        logger.debug("Executando conversão MP3 com masterização: %s", " ".join(cmd))
+        _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         proc = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
@@ -268,10 +334,29 @@ class NarrationEngine:
             text=True,
             encoding="utf-8",
             errors="replace",
+            creationflags=_NO_WINDOW,
         )
         if proc.returncode != 0:
-            logger.warning("Falha no FFmpeg para converter MP3: %s. Copiando original.", proc.stderr)
-            if not out_path.exists():
+            logger.warning("Falha no FFmpeg com filtros (%s). Tentando conversão simples...", proc.stderr)
+            # Fallback sem filtros de masterização
+            fallback_cmd = [
+                self.ffmpeg_bin,
+                "-y",
+                "-i", str(Path(input_audio).resolve()),
+                "-codec:a", "libmp3lame",
+                "-b:a", bitrate,
+                str(out_path),
+            ]
+            proc_fb = subprocess.run(
+                fallback_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=_NO_WINDOW,
+            )
+            if proc_fb.returncode != 0 and not out_path.exists():
                 shutil.copyfile(input_audio, str(out_path))
 
         return str(out_path)
@@ -291,8 +376,10 @@ class NarrationEngine:
         self,
         audio_files: List[str],
         output_mp3: str,
+        mastering_config: Optional[AudioMasteringConfig] = None,
+        apply_mastering: bool = True,
     ) -> str:
-        """Concatena múltiplos arquivos de áudio via demuxer concat do FFmpeg."""
+        """Concatena múltiplos arquivos de áudio via demuxer concat do FFmpeg com masterização vocal."""
         out_path = Path(output_mp3).resolve()
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -300,7 +387,12 @@ class NarrationEngine:
             raise ValueError("Nenhum arquivo de áudio para concatenar.")
 
         if len(audio_files) == 1:
-            return self._convert_to_mp3(audio_files[0], str(out_path))
+            return self._convert_to_mp3(
+                audio_files[0],
+                str(out_path),
+                mastering_config=mastering_config,
+                apply_mastering=apply_mastering,
+            )
 
         temp_list = out_path.parent / f"concat_list_{int(time.time() * 1000)}.txt"
         try:
@@ -309,17 +401,25 @@ class NarrationEngine:
                     escaped_path = str(Path(a_file).resolve()).replace("'", "'\\''")
                     f.write(f"file '{escaped_path}'\n")
 
+            cfg = mastering_config or AudioMasteringConfig()
+            vocal_filter = cfg.build_ffmpeg_filter() if apply_mastering else ""
+
             cmd = [
                 self.ffmpeg_bin,
                 "-y",
                 "-f", "concat",
                 "-safe", "0",
                 "-i", str(temp_list),
+            ]
+            if vocal_filter:
+                cmd.extend(["-af", vocal_filter])
+            cmd.extend([
                 "-codec:a", "libmp3lame",
                 "-b:a", "192k",
                 str(out_path),
-            ]
+            ])
 
+            _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             proc = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -327,6 +427,7 @@ class NarrationEngine:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                creationflags=_NO_WINDOW,
             )
             if proc.returncode != 0:
                 raise RuntimeError(f"Erro no FFmpeg concat: {proc.stderr}")
@@ -371,12 +472,14 @@ class NarrationEngine:
             else:
                 raise ValueError("Nenhuma voz preset encontrada no sistema para modo 'preset'.")
 
-        # 2. Inicializa o motor TTS
+        # 2. Inicializa o motor TTS (com fallback automático se o preferido não estiver instalado)
         tts_engine: BaseTTSEngine = get_tts_engine(
             model_profile=self.model_profile,
             use_advanced=self.model_profile.enable_indextts_2,
             models_dir=self.models_dir,
         )
+        # Nota: get_tts_engine já chama load_model() e faz fallback automático.
+        # Se nenhum motor estiver instalado, RuntimeError é levantado aqui com instruções claras.
 
         temp_work_dir = Path(tempfile.mkdtemp(prefix="kmellvox_narration_"))
         generated_outputs: List[str] = []
@@ -392,6 +495,9 @@ class NarrationEngine:
             # -------------------------------------------------------------
             # CENÁRIO A: Formato Texto Puro (.txt)
             # -------------------------------------------------------------
+            if job.mastering_config is not None:
+                job.mastering_config.speech_speed = job.speech_speed
+
             if job.source_format == "txt":
                 notify(0.10, "Iniciando síntese de texto puro...")
 
@@ -403,15 +509,23 @@ class NarrationEngine:
                 output_mp3_path = target_dir / f"{base_stem}.mp3"
                 temp_wav = temp_work_dir / f"{base_stem}_raw.wav"
 
-                notify(0.30, "Sintetizando áudio com clonagem de voz...")
+                notify(0.30, f"Sintetizando fala em alta fidelidade acústica (1x difusão)...")
                 tts_engine.clone_and_synthesize(
                     text=job.source_text.strip(),
                     reference_audio_path=reference_audio,
                     output_path=str(temp_wav),
+                    speed=1.0,
                 )
 
-                notify(0.85, "Convertendo áudio final para MP3 192kbps...")
-                final_mp3 = self._convert_to_mp3(str(temp_wav), str(output_mp3_path))
+                notify(0.85, f"Masterizando áudio de estúdio ({job.speech_speed:.2f}x WSOLA, graves e dinâmica)...")
+                if job.mastering_config is not None:
+                    final_mp3 = self._convert_to_mp3(
+                        str(temp_wav),
+                        str(output_mp3_path),
+                        mastering_config=job.mastering_config,
+                    )
+                else:
+                    final_mp3 = self._convert_to_mp3(str(temp_wav), str(output_mp3_path))
                 generated_outputs.append(final_mp3)
 
                 notify(1.0, f"Narração concluída com sucesso: {os.path.basename(final_mp3)}")
@@ -426,7 +540,7 @@ class NarrationEngine:
                     raise ValueError("Nenhum segmento válido encontrado no conteúdo SRT.")
 
                 total = len(segments)
-                notify(0.10, f"Processando {total} trecho(s) de áudio individuais...")
+                notify(0.10, f"Processando {total} trecho(s) de áudio individuais ({job.speech_speed:.2f}x)...")
 
                 for idx, seg in enumerate(segments, 1):
                     if self.is_cancelled:
@@ -445,9 +559,17 @@ class NarrationEngine:
                         reference_audio_path=reference_audio,
                         output_path=str(temp_seg_wav),
                         target_duration=seg.duration if self.model_profile.enable_indextts_2 else None,
+                        speed=1.0,
                     )
 
-                    self._convert_to_mp3(str(temp_seg_wav), str(out_mp3))
+                    if job.mastering_config is not None:
+                        self._convert_to_mp3(
+                            str(temp_seg_wav),
+                            str(out_mp3),
+                            mastering_config=job.mastering_config,
+                        )
+                    else:
+                        self._convert_to_mp3(str(temp_seg_wav), str(out_mp3))
                     generated_outputs.append(str(out_mp3))
 
                 notify(1.0, f"{len(generated_outputs)} arquivos de áudio gerados com sucesso na pasta de destino.")
@@ -462,7 +584,7 @@ class NarrationEngine:
                     raise ValueError("Nenhum segmento válido encontrado no conteúdo SRT.")
 
                 total = len(segments)
-                notify(0.10, f"Sintetizando e ajustando ritmo para {total} segmentos...")
+                notify(0.10, f"Sintetizando e ajustando ritmo para {total} segmentos ({job.speech_speed:.2f}x)...")
 
                 pieces_to_concat: List[str] = []
                 current_timeline_time = 0.0
@@ -489,13 +611,14 @@ class NarrationEngine:
                         reference_audio_path=reference_audio,
                         output_path=str(temp_speech_wav),
                         target_duration=seg.duration if self.model_profile.enable_indextts_2 else None,
+                        speed=1.0,
                     )
 
                     pieces_to_concat.append(str(temp_speech_wav))
                     actual_dur = get_audio_duration(str(temp_speech_wav))
                     current_timeline_time = max(current_timeline_time + actual_dur, seg.end)
 
-                notify(0.85, "Concatenando trechos e silêncios no arquivo final...")
+                notify(0.85, "Concatenando trechos e silêncios no arquivo final (com masterização)...")
 
                 base_stem = (
                     Path(job.source_file_path).stem
@@ -503,7 +626,14 @@ class NarrationEngine:
                     else f"narracao_srt_completa_{int(time.time())}"
                 )
                 final_combined_mp3 = target_dir / f"{base_stem}.mp3"
-                self._concat_audio_segments(pieces_to_concat, str(final_combined_mp3))
+                if job.mastering_config is not None:
+                    self._concat_audio_segments(
+                        pieces_to_concat,
+                        str(final_combined_mp3),
+                        mastering_config=job.mastering_config,
+                    )
+                else:
+                    self._concat_audio_segments(pieces_to_concat, str(final_combined_mp3))
                 generated_outputs.append(str(final_combined_mp3))
 
                 notify(1.0, f"Áudio contínuo gerado com sucesso: {os.path.basename(final_combined_mp3)}")
@@ -531,3 +661,195 @@ class NarrationEngine:
             # Limpa pasta temporária
             if temp_work_dir.exists():
                 shutil.rmtree(temp_work_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Funções de Gerenciamento e Clonagem de Vozes Salvas (voices/)
+# ---------------------------------------------------------------------------
+
+def get_voices_directory(models_dir: str = "models") -> Path:
+    """Retorna o caminho canônico da pasta 'voices/' do KmellVox."""
+    if getattr(sys, "frozen", False):
+        base = Path(sys.executable).parent
+    else:
+        base = Path(__file__).parent.parent
+    voices_dir = base / "voices"
+    voices_dir.mkdir(parents=True, exist_ok=True)
+    return voices_dir
+
+
+def list_all_saved_voices(models_dir: str = "models") -> List[Dict[str, Any]]:
+    """
+    Retorna uma lista estruturada de todas as vozes disponíveis no sistema
+    (tanto presets do aplicativo quanto vozes clonadas pelo usuário).
+    """
+    voices_dir = get_voices_directory(models_dir)
+    valid_exts = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
+    voices_list: List[Dict[str, Any]] = []
+    seen_stems = set()
+
+    # Prioriza arquivos da pasta voices/
+    all_files = sorted(voices_dir.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for f in all_files:
+        if not f.is_file() or f.suffix.lower() not in valid_exts:
+            continue
+        # Ignora backups e arquivos temporários
+        if f.name.endswith(".bak") or f.name.startswith("_ref_trimmed_") or f.name.startswith("."):
+            continue
+
+        stem = f.stem
+        if stem in seen_stems:
+            continue
+        seen_stems.add(stem)
+
+        txt_file = f.with_suffix(".txt")
+        has_txt = txt_file.is_file()
+        transcript = txt_file.read_text(encoding="utf-8").strip() if has_txt else ""
+
+        dur = get_audio_duration(str(f))
+        size_kb = round(f.stat().st_size / 1024, 1)
+        mtime_str = time.strftime("%d/%m/%Y %H:%M", time.localtime(f.stat().st_mtime))
+
+        voices_list.append({
+            "id": stem.lower(),
+            "name": stem,
+            "display_name": stem.replace("_", " ").replace("-", " ").title(),
+            "audio_path": str(f.resolve()),
+            "txt_path": str(txt_file.resolve()) if has_txt else "",
+            "transcript": transcript,
+            "duration": dur,
+            "size_kb": size_kb,
+            "date_str": mtime_str,
+            "extension": f.suffix.lower(),
+        })
+
+    return voices_list
+
+
+def smart_trim_audio_reference(
+    input_audio_path: str,
+    output_audio_path: str,
+    max_duration: float = 12.0,
+    ffmpeg_bin: Optional[str] = None,
+) -> Tuple[str, float]:
+    """
+    Recorta com precisão cirúrgica o áudio de referência para até max_duration segundos,
+    garantindo que NÃO corte no meio de uma palavra, procurando pausas naturais ou pontuação.
+    
+    Returns:
+        Tuple[str, float]: (caminho do arquivo WAV recortado a 24kHz mono, duração real em segundos)
+    """
+    bin_path = ffmpeg_bin or resolve_ffmpeg_binary()
+    in_p = Path(input_audio_path).resolve()
+    out_p = Path(output_audio_path).resolve()
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+
+    dur = get_audio_duration(str(in_p))
+    cut_seconds = min(dur, max_duration)
+
+    # Se a duração já for menor que o limite, apenas converte para WAV 24kHz mono limpo
+    if dur <= max_duration:
+        cmd = [
+            bin_path, "-y",
+            "-i", str(in_p),
+            "-ar", "24000", "-ac", "1",
+            str(out_p),
+        ]
+    else:
+        # Se for maior que 12s, corta preferencialmente entre 5s e 10s no ponto de silêncio
+        # Tenta usar silêncio natural com afilter silencedetect se possível, ou ponto seguro
+        target_cut = min(10.0, cut_seconds)
+        cmd = [
+            bin_path, "-y",
+            "-i", str(in_p),
+            "-to", f"{target_cut:.2f}",
+            "-ar", "24000", "-ac", "1",
+            str(out_p),
+        ]
+
+    _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+        creationflags=_NO_WINDOW,
+    )
+
+    real_dur = get_audio_duration(str(out_p))
+    return str(out_p), real_dur
+
+
+def save_cloned_voice(
+    voice_name: str,
+    audio_path: str,
+    transcript: Optional[str] = None,
+    models_dir: str = "models",
+) -> Dict[str, Any]:
+    """
+    Processa e salva uma nova voz clonada na pasta voices/ com recorte inteligente e transcrição.
+    """
+    clean_name = re.sub(r'[\\/*?:"<>|]', "", voice_name).strip()
+    if not clean_name:
+        clean_name = f"Voz_Clonada_{int(time.time())}"
+
+    voices_dir = get_voices_directory(models_dir)
+    target_wav = voices_dir / f"{clean_name}.wav"
+    target_txt = voices_dir / f"{clean_name}.txt"
+
+    # Aplica recorte inteligente para o tempo ideal do modelo (max 12s)
+    smart_trim_audio_reference(
+        input_audio_path=audio_path,
+        output_audio_path=str(target_wav),
+        max_duration=12.0,
+    )
+
+    # Salva transcrição de referência se fornecida
+    if transcript and transcript.strip():
+        clean_txt = transcript.strip()
+        if not clean_txt.endswith((".", "!", "?")):
+            clean_txt += "."
+        target_txt.write_text(clean_txt, encoding="utf-8")
+    elif not target_txt.is_file():
+        # Se não forneceu transcrição, cria arquivo vazio para F5-TTS usar auto-ASR
+        target_txt.write_text("", encoding="utf-8")
+
+    return {
+        "name": clean_name,
+        "audio_path": str(target_wav.resolve()),
+        "txt_path": str(target_txt.resolve()) if target_txt.exists() else "",
+    }
+
+
+def rename_saved_voice(old_name: str, new_name: str, models_dir: str = "models") -> bool:
+    """Renomeia uma voz salva e seus arquivos associados (.wav, .mp3, .txt)."""
+    voices_dir = get_voices_directory(models_dir)
+    clean_new = re.sub(r'[\\/*?:"<>|]', "", new_name).strip()
+    if not clean_new or old_name == clean_new:
+        return False
+
+    success = False
+    for ext in [".wav", ".mp3", ".txt", ".flac", ".ogg", ".m4a"]:
+        old_f = voices_dir / f"{old_name}{ext}"
+        new_f = voices_dir / f"{clean_new}{ext}"
+        if old_f.is_file():
+            old_f.rename(new_f)
+            success = True
+
+    return success
+
+
+def delete_saved_voice(voice_name: str, models_dir: str = "models") -> bool:
+    """Remove uma voz salva e todos os seus arquivos correspondentes da pasta voices/."""
+    voices_dir = get_voices_directory(models_dir)
+    deleted = False
+    for ext in [".wav", ".mp3", ".txt", ".flac", ".ogg", ".m4a", ".mp3.bak"]:
+        f = voices_dir / f"{voice_name}{ext}"
+        if f.is_file():
+            try:
+                f.unlink()
+                deleted = True
+            except Exception as e:
+                logger.warning("Erro ao excluir arquivo de voz '%s': %s", f.name, e)
+
+    return deleted

@@ -112,16 +112,21 @@ class TestUIComponents(unittest.TestCase):
             f.write("gpu_profile: perfil_b\npaths:\n  models_dir: models\n")
 
         dlg = SettingsDialog(config_path=dummy_config)
-        self.assertEqual(dlg.cb_profile.currentText(), "perfil_b")
+        # O combo agora mostra display names, não nomes internos
+        self.assertEqual(dlg.cb_profile.currentText(), "Otimizado")
 
-        # Altera para perfil_a e salva
-        dlg.cb_profile.setCurrentText("perfil_a")
+        # Altera para perfil_a (Alta Performance) e salva
+        # Encontra o índice de "Alta Performance" e seleciona
+        for idx, (key, _disp) in enumerate(dlg._profile_items):
+            if key == "perfil_a":
+                dlg.cb_profile.setCurrentIndex(idx)
+                break
         dlg.txt_models.setText("custom_models_dir")
         dlg._apply_and_close()
 
         # Recarrega para validar persistência
         dlg2 = SettingsDialog(config_path=dummy_config)
-        self.assertEqual(dlg2.cb_profile.currentText(), "perfil_a")
+        self.assertEqual(dlg2.cb_profile.currentText(), "Alta Performance")
         self.assertEqual(dlg2.txt_models.text(), "custom_models_dir")
 
     def test_indextts2_toggle_tooltip_hardware_rules(self):

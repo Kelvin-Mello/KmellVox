@@ -226,6 +226,13 @@ def get_model_size_mb(target_path: Path) -> float:
     return 0.0
 
 
+def format_bytes_human(num_bytes: int) -> str:
+    """Formata bytes em string humanamente legível (MB ou GB)."""
+    if num_bytes >= 1024 * 1024 * 1024:
+        return f"~{num_bytes / (1024 * 1024 * 1024):.1f} GB"
+    return f"~{num_bytes / (1024 * 1024):.0f} MB"
+
+
 def check_models_status(
     profile: Optional[str] = None,
     base_models_dir: str = "models",
@@ -254,6 +261,8 @@ def check_models_status(
             "path": str(target),
             "installed": installed,
             "size_mb": round(size_mb, 1),
+            "expected_min_bytes": spec.expected_min_bytes,
+            "expected_size_str": format_bytes_human(spec.expected_min_bytes),
             "description": spec.description,
             "profile_match": profile,
         })
@@ -381,10 +390,12 @@ def fetch_models_for_profile(
     force_download: bool = False,
     progress_callback: Optional[Callable[[float, str], None]] = None,
     verify_online_first: bool = True,
+    target_model_key: Optional[str] = None,
 ) -> Dict[str, str]:
     """
-    Baixa apenas os arquivos e checkpoints necessários para o perfil de hardware detectado/selecionado,
-    verificando integridade e salvando os caminhos finais em config.yaml.
+    Baixa apenas os arquivos e checkpoints necessários para o perfil de hardware detectado/selecionado
+    (ou um modelo individual específico via target_model_key), verificando integridade e salvando
+    os caminhos finais em config.yaml.
     """
     ensure_safe_streams()
 
@@ -394,7 +405,13 @@ def fetch_models_for_profile(
     base = Path(base_models_dir).resolve()
     base.mkdir(parents=True, exist_ok=True)
 
-    target_specs = [m for m in MODEL_CATALOG if profile in m.profiles]
+    if target_model_key:
+        target_specs = [m for m in MODEL_CATALOG if m.key == target_model_key]
+        if not target_specs:
+            logger.warning("Nenhum modelo encontrado no catálogo para a chave '%s'", target_model_key)
+    else:
+        target_specs = [m for m in MODEL_CATALOG if profile in m.profiles]
+
     total_specs = len(target_specs)
     saved_paths: Dict[str, str] = {}
 

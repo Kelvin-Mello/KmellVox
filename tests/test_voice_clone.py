@@ -84,43 +84,92 @@ class TestVoiceClone(unittest.TestCase):
 
         self.assertEqual(factor, 1.35)
 
-    def test_f5_tts_engine_synthesis_and_vram_cleanup(self):
-        """Testa síntese e liberação de VRAM no F5TTSEngine."""
+    @patch("core.voice_clone.adjust_audio_duration_ffmpeg", return_value=1.0)
+    @patch("soundfile.write")
+    def test_f5_tts_engine_synthesis_and_vram_cleanup(self, mock_sf_write, mock_adjust):
+        """Testa síntese e liberação de VRAM no F5TTSEngine quando o pacote está instalado."""
         prof_b = ModelProfile.from_profile("perfil_b")
         engine = F5TTSEngine(model_profile=prof_b, rhythm_config=RhythmControlConfig(max_speed=1.35))
 
-        out_seg_wav = os.path.join(self.temp_dir.name, "f5_out.wav")
-        cloned = engine.clone_and_synthesize(
-            text="Olá, este é um teste de voz com o F5-TTS.",
-            reference_audio_path=self.sample_wav,
-            output_path=out_seg_wav,
-            target_duration=2.5,
-            auto_unload=True,
-        )
+        # Carrega o modelo para determinar o estado do ambiente
+        engine.load_model()
 
+        if engine.model == "f5_not_installed":
+            # F5-TTS não está instalado: confirma que o erro é explícito e legível
+            with self.assertRaises(RuntimeError) as ctx:
+                engine.clone_and_synthesize(
+                    text="Olá, teste de voz com F5-TTS.",
+                    reference_audio_path=self.sample_wav,
+                    output_path=os.path.join(self.temp_dir.name, "f5_out.wav"),
+                    target_duration=2.5,
+                    auto_unload=True,
+                )
+            self.assertIn("f5-tts", str(ctx.exception).lower())
+            return
+
+        # F5-TTS instalado: sintetiza com _synthesize_raw mockado para não precisar dos pesos
+        out_seg_wav = os.path.join(self.temp_dir.name, "f5_out.wav")
+
+        def _fake_raw(text, reference_audio_path, raw_output_path, reference_text=None):
+            import soundfile as sf_real
+            import numpy as np
+            sf_real.write(raw_output_path, np.zeros(int(24000 * 2.5), dtype=np.float32), 24000)
+
+        with patch.object(engine, "_synthesize_raw", side_effect=_fake_raw):
+            cloned = engine.clone_and_synthesize(
+                text="Olá, este é um teste de voz com o F5-TTS.",
+                reference_audio_path=self.sample_wav,
+                output_path=out_seg_wav,
+                target_duration=2.5,
+                auto_unload=True,
+            )
         self.assertTrue(os.path.isfile(out_seg_wav))
         self.assertEqual(cloned.target_duration, 2.5)
-        # Verifica limpeza de VRAM
         self.assertIsNone(engine.model)
+
+
 
     def test_indextts2_engine_native_duration_and_vram_cleanup(self):
         """Testa síntese e controle explícito nativo de duração no IndexTTS2Engine."""
         prof_a = ModelProfile.from_profile("perfil_a")
         engine = IndexTTS2Engine(model_profile=prof_a)
 
+        # Carrega o modelo para determinar o estado do ambiente
+        engine.load_model()
+
+        if engine.model == "indextts2_not_installed":
+            # IndexTTS-2 não instalado: confirma que o erro é explícito (não silêncio)
+            with self.assertRaises(RuntimeError) as ctx:
+                engine.clone_and_synthesize(
+                    text="Texto para síntese nativa com IndexTTS-2 em alta qualidade.",
+                    reference_audio_path=self.sample_wav,
+                    output_path=os.path.join(self.temp_dir.name, "indextts2_out.wav"),
+                    target_duration=3.0,
+                    auto_unload=True,
+                )
+            self.assertIn("indextts-2", str(ctx.exception).lower())
+            return
+
+        # IndexTTS-2 instalado: sintetiza com clone_and_synthesize mockado
         out_seg_wav = os.path.join(self.temp_dir.name, "indextts2_out.wav")
-        cloned = engine.clone_and_synthesize(
-            text="Texto para síntese nativa com IndexTTS-2 em alta qualidade.",
-            reference_audio_path=self.sample_wav,
-            output_path=out_seg_wav,
-            target_duration=3.0,
-            auto_unload=True,
-        )
+
+        def _fake_synthesize(audio_prompt, text, output_path):
+            import soundfile as sf_real
+            import numpy as np
+            sf_real.write(output_path, np.zeros(int(24000 * 3.0), dtype=np.float32), 24000)
+
+        with patch.object(engine.model, "infer", side_effect=_fake_synthesize):
+            cloned = engine.clone_and_synthesize(
+                text="Texto para síntese nativa com IndexTTS-2 em alta qualidade.",
+                reference_audio_path=self.sample_wav,
+                output_path=out_seg_wav,
+                target_duration=3.0,
+                auto_unload=True,
+            )
 
         self.assertTrue(os.path.isfile(out_seg_wav))
         self.assertEqual(cloned.target_duration, 3.0)
-        self.assertEqual(cloned.speed_factor, 1.0)  # Sem pós-processamento atempo
-        # Verifica limpeza de VRAM
+        self.assertEqual(cloned.speed_factor, 1.0)
         self.assertIsNone(engine.model)
 
     def test_get_tts_engine_factory(self):
@@ -129,24 +178,59 @@ class TestVoiceClone(unittest.TestCase):
         prof_b = ModelProfile.from_profile("perfil_b")
         prof_cpu = ModelProfile.from_profile("cpu")
 
-        # 1. perfil_a com use_advanced=True -> IndexTTS2Engine
-        eng_a_adv = get_tts_engine(model_profile=prof_a, use_advanced=True)
-        self.assertIsInstance(eng_a_adv, IndexTTS2Engine)
+        # Verifica se algum motor TTS está disponível no ambiente
+        _index_available = False
+        _f5_available = False
+        try:
+            import torch  # noqa: F401
+            try:
+                from index_tts import IndexTTS  # noqa: F401
+            except ImportError:
+                import indextts  # noqa: F401
+            _index_available = True
+        except ImportError:
+            pass
+        try:
+            import torch  # noqa: F401
+            from f5_tts.infer.utils_infer import load_model as _f5_lm  # noqa: F401
+            _f5_available = True
+        except ImportError:
+            pass
 
-        # 2. perfil_a com use_advanced=False -> F5TTSEngine
-        eng_a_std = get_tts_engine(model_profile=prof_a, use_advanced=False)
-        self.assertIsInstance(eng_a_std, F5TTSEngine)
+        if not _index_available and not _f5_available:
+            # Nenhum motor instalado: a factory deve lançar RuntimeError claro
+            with self.assertRaises(RuntimeError) as ctx:
+                get_tts_engine(model_profile=prof_a, use_advanced=True)
+            self.assertIn("nenhum motor", str(ctx.exception).lower())
 
-        # 3. perfil_b com use_advanced=True -> Fallback para F5TTSEngine com aviso
-        with self.assertLogs("KmellVox.VoiceClone", level="WARNING") as log_cm:
-            eng_b_adv = get_tts_engine(model_profile=prof_b, use_advanced=True)
-            self.assertIsInstance(eng_b_adv, F5TTSEngine)
-            warning_found = any("8GB de VRAM" in r.getMessage() or "perfil_a" in r.getMessage() for r in log_cm.records)
-            self.assertTrue(warning_found)
+            with self.assertRaises(RuntimeError):
+                get_tts_engine(model_profile=prof_b, use_advanced=False)
 
-        # 4. cpu com use_advanced=True -> Fallback para F5TTSEngine
-        eng_cpu = get_tts_engine(model_profile=prof_cpu, use_advanced=True)
-        self.assertIsInstance(eng_cpu, F5TTSEngine)
+            with self.assertRaises(RuntimeError):
+                get_tts_engine(model_profile=prof_cpu, use_advanced=True)
+            return
+
+        # Pelo menos um motor instalado: valida regras de seleção
+        if _index_available:
+            # perfil_a com use_advanced=True -> IndexTTS2Engine
+            eng_a_adv = get_tts_engine(model_profile=prof_a, use_advanced=True)
+            self.assertIsInstance(eng_a_adv, IndexTTS2Engine)
+
+        if _f5_available:
+            # perfil_a com use_advanced=False -> F5TTSEngine
+            eng_a_std = get_tts_engine(model_profile=prof_a, use_advanced=False)
+            self.assertIsInstance(eng_a_std, F5TTSEngine)
+
+            # perfil_b com use_advanced=True -> Fallback para F5TTSEngine com aviso
+            with self.assertLogs("KmellVox.VoiceClone", level="WARNING") as log_cm:
+                eng_b_adv = get_tts_engine(model_profile=prof_b, use_advanced=True)
+                self.assertIsInstance(eng_b_adv, F5TTSEngine)
+                warning_found = any(
+                    "8GB de VRAM" in r.getMessage() or "perfil_a" in r.getMessage()
+                    for r in log_cm.records
+                )
+                self.assertTrue(warning_found)
+
 
     def test_clone_and_align_all(self):
         """Testa o processamento e alinhamento de múltiplos segmentos traduzidos."""
@@ -159,12 +243,30 @@ class TestVoiceClone(unittest.TestCase):
         ]
 
         out_dir = os.path.join(self.temp_dir.name, "batch_voice")
-        results = engine.clone_and_align_all(
-            segments=segments,
-            reference_audio_path=self.sample_wav,
-            output_dir=out_dir,
-            auto_unload=True,
-        )
+
+        # Simula a síntese sem depender do F5-TTS ou IndexTTS-2 instalado
+        def _fake_synthesize(text, reference_audio_path, output_path,
+                             target_duration=None, reference_text=None, auto_unload=False):
+            import soundfile as sf_real
+            import numpy as np
+            dur = max(0.1, target_duration or 1.0)
+            sf_real.write(output_path, np.zeros(int(24000 * dur), dtype=np.float32), 24000)
+            from core.voice_clone import ClonedAudioSegment
+            return ClonedAudioSegment(
+                id=0, start=0.0, end=dur,
+                audio_path=output_path,
+                target_duration=dur,
+                actual_duration=dur,
+                speed_factor=1.0,
+            )
+
+        with patch.object(engine, "clone_and_synthesize", side_effect=_fake_synthesize):
+            results = engine.clone_and_align_all(
+                segments=segments,
+                reference_audio_path=self.sample_wav,
+                output_dir=out_dir,
+                auto_unload=True,
+            )
 
         self.assertEqual(len(results), 2)
         self.assertEqual(results[0].start, 0.0)

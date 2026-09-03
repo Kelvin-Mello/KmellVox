@@ -25,8 +25,13 @@ tools/ffmpeg/
 # Outputs & Temp
 temp/
 output/
+output_test_audio/
+scratch/
+scratch_*.py
+deps_status.txt
 *.mp4
 *.wav
+!voices/*.wav
 *.mp3
 *.srt
 *.log

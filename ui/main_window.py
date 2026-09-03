@@ -9,14 +9,17 @@ Inclui:
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
+logger = logging.getLogger("KmellVox.MainWindow")
+
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QIcon
+from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QIcon, QImage, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -44,7 +47,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.hardware import detect_hardware
+from core.hardware import PROFILE_DISPLAY_NAMES, detect_hardware
 from core.pipeline import DubPipeline, PipelineConfig, PipelineProgress
 from .narration_tab import NarrationTab
 from .queue_widget import JobItem, QueueWidget
@@ -63,22 +66,70 @@ ALL_LANGUAGES = [
     ("zh", "Chinês (中文)"),
 ]
 
-DARK_THEME_QSS = """
-QMainWindow, QWidget {
+def _generate_default_icons(icons_dir: Path) -> None:
+    """Gera automaticamente ícones vetoriais de estado caso não existam no disco."""
+    icons_dir.mkdir(parents=True, exist_ok=True)
+    check_file = icons_dir / "check_icon.png"
+    arrow_file = icons_dir / "arrow_down.png"
+
+    if not check_file.is_file():
+        img = QImage(18, 18, QImage.Format_ARGB32_Premultiplied)
+        img.fill(0)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(QColor(18, 18, 20), 2.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        p.setPen(pen)
+        p.drawLine(4, 9, 7, 13)
+        p.drawLine(7, 13, 14, 5)
+        p.end()
+        img.save(str(check_file))
+
+    if not arrow_file.is_file():
+        img = QImage(14, 14, QImage.Format_ARGB32_Premultiplied)
+        img.fill(0)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(QColor(225, 225, 230), 2.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        p.setPen(pen)
+        p.drawLine(3, 5, 7, 9)
+        p.drawLine(7, 9, 11, 5)
+        p.end()
+        img.save(str(arrow_file))
+
+
+def build_dark_theme_qss() -> str:
+    """Gera a folha de estilos completa e dinâmica com ícones em alta resolução para alto contraste."""
+    base_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).parent.parent))
+    icons_dir = base_dir / "ui" / "assets"
+    check_icon = (icons_dir / "check_icon.png").resolve()
+    arrow_down = (icons_dir / "arrow_down.png").resolve()
+
+    if not check_icon.is_file() or not arrow_down.is_file():
+        try:
+            _generate_default_icons(icons_dir)
+        except Exception:
+            pass
+
+    check_rule = f"image: url('{str(check_icon).replace(chr(92), '/')}');" if check_icon.is_file() else ""
+    arrow_rule = f"image: url('{str(arrow_down).replace(chr(92), '/')}');" if arrow_down.is_file() else ""
+
+    return f"""
+QMainWindow, QWidget {{
     background-color: #121214;
     color: #E1E1E6;
     font-family: 'Segoe UI', Arial, sans-serif;
     font-size: 13px;
-}
+}}
 
-QTabWidget::pane {
+/* --- Abas --- */
+QTabWidget::pane {{
     border: 1px solid #29292E;
     border-radius: 8px;
     background-color: #121214;
     top: -1px;
-}
+}}
 
-QTabBar::tab {
+QTabBar::tab {{
     background-color: #19191B;
     color: #A8A8B3;
     border: 1px solid #29292E;
@@ -88,139 +139,368 @@ QTabBar::tab {
     padding: 8px 20px;
     margin-right: 4px;
     font-weight: 500;
-}
+}}
 
-QTabBar::tab:selected {
+QTabBar::tab:selected {{
     background-color: #202024;
     color: #04D361;
     border-color: #323238;
     font-weight: bold;
-}
+}}
 
-QTabBar::tab:hover:!selected {
+QTabBar::tab:hover:!selected {{
     background-color: #29292E;
     color: #E1E1E6;
-}
+}}
 
-QGroupBox {
+/* --- Agrupamentos --- */
+QGroupBox {{
     border: 1px solid #29292E;
     border-radius: 8px;
     margin-top: 10px;
     padding-top: 14px;
     font-weight: bold;
     color: #A8A8B3;
-}
+}}
 
-QGroupBox::title {
+QGroupBox::title {{
     subcontrol-origin: margin;
     left: 12px;
     padding: 0 4px;
-}
+}}
 
-QGroupBox#experimental_group {
+QGroupBox#experimental_group {{
     border: 1px dashed #FFA200;
     border-radius: 8px;
     margin-top: 8px;
     padding-top: 10px;
     color: #FFA200;
-}
+}}
 
-QPushButton {
+/* --- Botões --- */
+QPushButton {{
     background-color: #202024;
     color: #E1E1E6;
     border: 1px solid #323238;
     border-radius: 6px;
     padding: 6px 14px;
     font-weight: 500;
-}
+}}
 
-QPushButton:hover {
+QPushButton:hover {{
     background-color: #29292E;
-    border-color: #48484F;
-}
+    border-color: #52525B;
+    color: #FFFFFF;
+}}
 
-QPushButton:pressed {
+QPushButton:pressed {{
     background-color: #121214;
-}
+}}
 
-QPushButton#btn_primary {
+QPushButton:disabled {{
+    background-color: #18181B;
+    border-color: #27272A;
+    color: #71717A;
+}}
+
+QPushButton#btn_primary {{
     background-color: #8257E5;
     color: #FFFFFF;
     border: none;
     font-weight: bold;
-}
+}}
 
-QPushButton#btn_primary:hover {
+QPushButton#btn_primary:hover {{
     background-color: #9466FF;
-}
+}}
 
-QTableWidget, QListWidget, QPlainTextEdit {
+/* --- Botões de Rádio (Seleção Única de Alto Contraste) --- */
+QRadioButton {{
+    color: #E1E1E6;
+    spacing: 10px;
+    font-size: 13px;
+    font-weight: 500;
+    padding: 4px 2px;
+}}
+
+QRadioButton:hover {{
+    color: #FFFFFF;
+}}
+
+QRadioButton:disabled {{
+    color: #71717A;
+}}
+
+QRadioButton::indicator {{
+    width: 20px;
+    height: 20px;
+    border-radius: 11px;
+    border: 2px solid #52525B;
+    background-color: #18181B;
+}}
+
+QRadioButton::indicator:hover {{
+    border: 2px solid #04D361;
+    background-color: #27272A;
+}}
+
+QRadioButton::indicator:checked {{
+    border: 2px solid #04D361;
+    background: qradialgradient(cx:0.5, cy:0.5, radius:0.4, fx:0.5, fy:0.5, stop:0 #04D361, stop:0.55 #04D361, stop:0.6 transparent, stop:1 transparent);
+}}
+
+QRadioButton::indicator:checked:hover {{
+    border: 2px solid #00E676;
+    background: qradialgradient(cx:0.5, cy:0.5, radius:0.45, fx:0.5, fy:0.5, stop:0 #00E676, stop:0.6 #00E676, stop:0.65 transparent, stop:1 transparent);
+}}
+
+QRadioButton::indicator:disabled {{
+    border-color: #3F3F46;
+    background-color: #121214;
+}}
+
+/* --- Caixas de Seleção (Checkboxes de Alto Contraste) --- */
+QCheckBox {{
+    color: #E1E1E6;
+    spacing: 10px;
+    font-size: 13px;
+    font-weight: 500;
+    padding: 4px 2px;
+}}
+
+QCheckBox:hover {{
+    color: #FFFFFF;
+}}
+
+QCheckBox:disabled {{
+    color: #71717A;
+}}
+
+QCheckBox::indicator {{
+    width: 20px;
+    height: 20px;
+    border-radius: 5px;
+    border: 2px solid #52525B;
+    background-color: #18181B;
+}}
+
+QCheckBox::indicator:hover {{
+    border: 2px solid #04D361;
+    background-color: #27272A;
+}}
+
+QCheckBox::indicator:checked {{
+    border: 2px solid #04D361;
+    background-color: #04D361;
+    {check_rule}
+}}
+
+QCheckBox::indicator:checked:hover {{
+    border-color: #00E676;
+    background-color: #00E676;
+}}
+
+QCheckBox::indicator:disabled {{
+    border-color: #3F3F46;
+    background-color: #121214;
+}}
+
+/* --- Barra de Seleção (QComboBox) --- */
+QComboBox {{
+    background-color: #202024;
+    border: 1.5px solid #3F3F46;
+    border-radius: 6px;
+    padding: 6px 12px;
+    min-height: 26px;
+    color: #FFFFFF;
+    font-weight: 500;
+    font-size: 13px;
+}}
+
+QComboBox:hover {{
+    border-color: #8257E5;
+    background-color: #27272A;
+}}
+
+QComboBox:focus {{
+    border-color: #9466FF;
+}}
+
+QComboBox:disabled {{
+    background-color: #18181B;
+    border-color: #2E2E35;
+    color: #71717A;
+}}
+
+QComboBox::drop-down {{
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 32px;
+    border-left: 1px solid #323238;
+    border-top-right-radius: 6px;
+    border-bottom-right-radius: 6px;
+    background-color: #27272A;
+}}
+
+QComboBox::drop-down:hover {{
+    background-color: #383842;
+}}
+
+QComboBox::down-arrow {{
+    {arrow_rule}
+    width: 14px;
+    height: 14px;
+}}
+
+QComboBox QAbstractItemView {{
+    background-color: #202024;
+    border: 1.5px solid #3F3F46;
+    border-radius: 6px;
+    color: #E1E1E6;
+    selection-background-color: #8257E5;
+    selection-color: #FFFFFF;
+    outline: none;
+    padding: 6px;
+}}
+
+/* --- Campos de Texto (QLineEdit) --- */
+QLineEdit {{
+    background-color: #202024;
+    border: 1.5px solid #3F3F46;
+    border-radius: 6px;
+    padding: 6px 10px;
+    color: #FFFFFF;
+    font-size: 13px;
+}}
+
+QLineEdit:hover {{
+    border-color: #52525B;
+}}
+
+QLineEdit:focus {{
+    border-color: #8257E5;
+}}
+
+QLineEdit:disabled {{
+    background-color: #18181B;
+    border-color: #2E2E35;
+    color: #71717A;
+}}
+
+/* --- Tabelas, Listas e Editores --- */
+QTableWidget, QListWidget, QPlainTextEdit {{
     background-color: #19191B;
     border: 1px solid #29292E;
     border-radius: 6px;
     gridline-color: #29292E;
     color: #E1E1E6;
-}
+}}
 
-QHeaderView::section {
+QHeaderView::section {{
     background-color: #202024;
     color: #A8A8B3;
     padding: 6px;
     border: none;
     font-weight: bold;
-}
+}}
 
-QProgressBar {
+QProgressBar {{
     border: 1px solid #29292E;
     border-radius: 4px;
     text-align: center;
     background-color: #202024;
     color: #FFFFFF;
-}
+}}
 
-QProgressBar::chunk {
+QProgressBar::chunk {{
     background-color: #04D361;
     border-radius: 3px;
-}
+}}
 
-QComboBox, QLineEdit {
-    background-color: #202024;
-    border: 1px solid #323238;
-    border-radius: 6px;
-    padding: 5px;
-    color: #E1E1E6;
-}
-
-QTextEdit {
+QTextEdit {{
     background-color: #09090A;
     border: 1px solid #29292E;
     border-radius: 6px;
     font-family: 'Consolas', 'Courier New', monospace;
     font-size: 12px;
     color: #04D361;
-}
+}}
 
-QSlider::groove:horizontal {
+QSlider::groove:horizontal {{
     border: 1px solid #323238;
     height: 6px;
     background: #202024;
     margin: 2px 0;
     border-radius: 3px;
-}
+}}
 
-QSlider::handle:horizontal {
+QSlider::handle:horizontal {{
     background: #8257E5;
     border: 1px solid #8257E5;
     width: 14px;
     height: 14px;
     margin: -4px 0;
     border-radius: 7px;
-}
+}}
 
-QSlider::handle:horizontal:hover {
+QSlider::handle:horizontal:hover {{
     background: #9466FF;
-}
+}}
+
+/* --- Barras de Rolagem (QScrollBar de Alta Visibilidade) --- */
+QScrollBar:vertical {{
+    border: none;
+    background-color: #18181B;
+    width: 12px;
+    margin: 0px;
+    border-radius: 6px;
+}}
+
+QScrollBar::handle:vertical {{
+    background-color: #3F3F46;
+    min-height: 26px;
+    border-radius: 5px;
+    margin: 2px;
+}}
+
+QScrollBar::handle:vertical:hover {{
+    background-color: #04D361;
+}}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+    height: 0px;
+    border: none;
+    background: none;
+}}
+
+QScrollBar:horizontal {{
+    border: none;
+    background-color: #18181B;
+    height: 12px;
+    margin: 0px;
+    border-radius: 6px;
+}}
+
+QScrollBar::handle:horizontal {{
+    background-color: #3F3F46;
+    min-width: 26px;
+    border-radius: 5px;
+    margin: 2px;
+}}
+
+QScrollBar::handle:horizontal:hover {{
+    background-color: #04D361;
+}}
+
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+    width: 0px;
+    border: none;
+    background: none;
+}}
 """
+
+DARK_THEME_QSS = build_dark_theme_qss()
+
 
 
 class DropArea(QFrame):
@@ -373,7 +653,23 @@ class MainWindow(QMainWindow):
 
         self.worker_thread: Optional[PipelineWorkerThread] = None
         self._init_ui()
-        self._refresh_hardware_status()
+
+        # Centraliza a janela no monitor
+        self._center_on_screen()
+
+        # Adia a detecção de hardware para depois do primeiro render completo da janela.
+        # Isso elimina o efeito de piscar causado pelo bloqueio síncrono de CUDA.
+        QTimer.singleShot(150, self._refresh_hardware_status)
+
+    def _center_on_screen(self) -> None:
+        """Centraliza a janela no monitor primário."""
+        screen = self.screen()
+        if screen is not None:
+            screen_geometry = screen.availableGeometry()
+            window_geometry = self.frameGeometry()
+            center_point = screen_geometry.center()
+            window_geometry.moveCenter(center_point)
+            self.move(window_geometry.topLeft())
 
     def _init_ui(self) -> None:
         central = QWidget()
@@ -610,21 +906,22 @@ class MainWindow(QMainWindow):
 
     def _refresh_hardware_status(self) -> None:
         hw = detect_hardware()
+        display = hw.model_profile.display_name
         if hw.cuda_available:
-            self.badge_hardware.setText(f"🚀 CUDA: {hw.device_name} ({hw.vram_total_gb:.1f} GB) - Perfil: {hw.profile.value}")
+            self.badge_hardware.setText(f"🚀 CUDA: {hw.device_name} ({hw.vram_total_gb:.1f} GB) — {display}")
         else:
-            self.badge_hardware.setText(f"💻 CPU Mode ({hw.cpu_cores} cores)")
+            self.badge_hardware.setText(f"💻 {display} ({hw.cpu_cores} cores)")
             self.badge_hardware.setStyleSheet("background-color: #383840; color: #FFA200; padding: 5px 12px; border-radius: 12px;")
 
         if hw.model_profile.enable_indextts_2:
             self.chk_indextts2.setEnabled(True)
-            self.chk_indextts2.setToolTip("IndexTTS-2 em FP16 com controle nativo de duração (Habilitado para perfil_a 8GB+ VRAM).")
+            self.chk_indextts2.setToolTip("IndexTTS-2 em FP16 com controle nativo de duração (Habilitado para Alta Performance, 8GB+ VRAM).")
         else:
             self.chk_indextts2.setEnabled(False)
             self.chk_indextts2.setChecked(False)
             self.chk_indextts2.setToolTip(
-                f"Qualidade máxima (IndexTTS-2) requer no mínimo 8GB de VRAM (perfil_a). "
-                f"Seu perfil detectado é '{hw.model_profile.profile_name}', utilizando F5-TTS com Controle de Ritmo."
+                f"Qualidade máxima (IndexTTS-2) requer no mínimo 8GB de VRAM (Alta Performance). "
+                f"Seu perfil detectado é '{display}', utilizando F5-TTS com Controle de Ritmo."
             )
 
         if hasattr(self, "tab_narration"):
@@ -740,18 +1037,67 @@ class MainWindow(QMainWindow):
             self.btn_cancel.setEnabled(False)
 
     def _open_settings(self) -> None:
-        dlg = SettingsDialog("config.yaml", self)
-        if dlg.exec():
-            self._refresh_hardware_status()
-            self._log("Configurações atualizadas com sucesso.")
+        try:
+            dlg = SettingsDialog("config.yaml", self)
+            if dlg.exec():
+                self._refresh_hardware_status()
+                self._log("Configurações atualizadas com sucesso.")
+        except Exception as e:
+            logger.error("Erro ao abrir configurações: %s", e, exc_info=True)
+            self._log(f"❌ Erro ao abrir configurações: {e}")
+            QMessageBox.critical(
+                self,
+                "Erro ao Abrir Configurações",
+                f"Não foi possível abrir o diálogo de configurações:\n\n{e}",
+            )
 
     def open_first_run_downloader(self) -> None:
         """Abre o diálogo de configurações focado no download de modelos na primeira execução."""
         self._log("Primeira execução detectada. Abrindo gerenciador de modelos...")
-        dlg = SettingsDialog("config.yaml", self)
-        dlg.setWindowTitle("Bem-vindo ao KmellVox - Instalação de Modelos")
-        dlg.exec()
-        self._refresh_hardware_status()
+        try:
+            dlg = SettingsDialog("config.yaml", self)
+            dlg.setWindowTitle("Bem-vindo ao KmellVox - Instalação de Modelos")
+            dlg.exec()
+            self._refresh_hardware_status()
+        except Exception as e:
+            logger.error("Erro no gerenciador de modelos: %s", e, exc_info=True)
+            self._log(f"❌ Erro no gerenciador de modelos: {e}")
 
     def _log(self, text: str) -> None:
         self.txt_logs.append(f"[{time.strftime('%H:%M:%S')}] {text}")
+
+    def closeEvent(self, event) -> None:
+        """Encerramento limpo: mata threads, libera VRAM e encerra o processo."""
+        import gc
+        logger.info("Encerrando KmellVox Studio...")
+
+        # 1. Cancela thread de narração se ativa
+        if hasattr(self, "tab_narration") and self.tab_narration:
+            try:
+                self.tab_narration.cleanup()
+            except Exception as e:
+                logger.warning("Erro ao limpar aba de narração: %s", e)
+
+        # 2. Cancela thread de dublagem se ativa
+        if self.worker_thread and self.worker_thread.isRunning():
+            try:
+                self.worker_thread.terminate()
+                self.worker_thread.wait(2000)
+            except Exception as e:
+                logger.warning("Erro ao encerrar thread de dublagem: %s", e)
+
+        # 3. Limpa VRAM e memória
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+        logger.info("KmellVox Studio encerrado com sucesso.")
+        event.accept()
+
+        # 4. Força encerramento do processo para garantir que nenhuma thread órfã sobreviva
+        import os
+        os._exit(0)

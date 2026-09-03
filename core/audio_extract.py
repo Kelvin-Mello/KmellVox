@@ -121,7 +121,17 @@ def get_audio_info(input_file: str, ffprobe_bin: Optional[str] = None) -> AudioM
     ]
     
     try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+            creationflags=_NO_WINDOW,
+        )
         data = json.loads(result.stdout)
         
         streams = data.get("streams", [])
