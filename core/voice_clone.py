@@ -40,6 +40,9 @@ class RhythmControlConfig:
     cross_fade_duration: float = 0.15
 
 
+DEFAULT_SENTENCE_PAUSE_SECONDS = 0.80  # Pausa natural entre frases calibrada pela voz original (800ms)
+
+
 @dataclass
 class ClonedAudioSegment:
     """Representa um segmento de áudio clonado e alinhado no tempo."""
@@ -224,6 +227,60 @@ class BaseTTSEngine(abc.ABC):
         """Sintetiza um segmento de áudio clonando a voz de referência."""
         pass
 
+    @staticmethod
+    def _concat_wav_files(
+        wav_files: List[str],
+        output_path: str,
+        pause_seconds: float = DEFAULT_SENTENCE_PAUSE_SECONDS,
+    ) -> None:
+        """
+        Concatena múltiplos arquivos WAV em um único arquivo de saída.
+        Insere um silêncio acústico suave (pause_seconds) entre os blocos
+        para reproduzir fielmente os respiros contemplativos da voz original.
+        """
+        import numpy as np
+
+        if not wav_files:
+            return
+        if len(wav_files) == 1:
+            shutil.copyfile(wav_files[0], output_path)
+            return
+
+        all_audio: List[Any] = []
+        target_sr: Optional[int] = None
+
+        for wf in wav_files:
+            try:
+                data, sr = sf.read(wf, dtype="float32")
+                if target_sr is None:
+                    target_sr = sr
+                elif sr != target_sr:
+                    # Resample simples se sample rates diferirem
+                    logger.warning(
+                        "Sample rate diferente em chunk (%d vs %d). Usando o primeiro.", sr, target_sr
+                    )
+                if data.ndim > 1:
+                    data = data.mean(axis=1)  # Converte stereo para mono
+                all_audio.append(data)
+            except Exception as e:
+                logger.warning("Erro ao ler chunk WAV '%s': %s. Ignorando.", wf, e)
+
+        if not all_audio or target_sr is None:
+            raise RuntimeError("Nenhum chunk de áudio válido para concatenar.")
+
+        # Inserção da pausa de silêncio calibrada entre as sentenças
+        silence_samples = int(max(0.0, pause_seconds) * target_sr)
+        silence_gap = np.zeros(silence_samples, dtype=np.float32) if silence_samples > 0 else None
+
+        combined_parts = []
+        for i, arr in enumerate(all_audio):
+            combined_parts.append(arr)
+            if silence_gap is not None and i < len(all_audio) - 1:
+                combined_parts.append(silence_gap)
+
+        combined = np.concatenate(combined_parts)
+        sf.write(output_path, combined, target_sr)
+
     def clone_and_align_all(
         self,
         segments: List[Union[TranslatedSegment, Dict[str, Any], Any]],
@@ -294,7 +351,6 @@ class BaseTTSEngine(abc.ABC):
 _MAX_CHUNK_CHARS = 200
 _LONG_TEXT_THRESHOLD = 300  # Aciona chunking quando o texto excede este limite
 _MAX_REF_AUDIO_SECONDS = 15.0  # Limite máximo recomendado para áudio de referência no F5-TTS
-DEFAULT_SENTENCE_PAUSE_SECONDS = 0.80  # Pausa natural entre frases calibrada pela voz original (800ms)
 
 
 def split_text_into_sentences(text: str) -> List[str]:
@@ -305,8 +361,9 @@ def split_text_into_sentences(text: str) -> List[str]:
     if not text or not text.strip():
         return []
 
-    # Divide por quebras de linha ou pontuação final (. ! ?) seguida de espaço
-    sentence_pattern = _re.compile(r'(?<=[.!?])\s+|\n+')
+    # Divide por quebras de linha ou pontuação final (. ! ?) seguida de espaço,
+    # preservando reticências dramáticas com continuação minúscula (... and, … but) na mesma oração
+    sentence_pattern = _re.compile(r'(?<!\.\.)(?<!…)(?<=[.!?])\s+|\n+|(?<=[…\.\.\.])\s+(?=[A-ZÀ-ÿ0-9"“\'‘])')
     raw_sentences = sentence_pattern.split(text.strip())
     return [s.strip() for s in raw_sentences if s.strip()]
 
@@ -727,60 +784,6 @@ class F5TTSEngine(BaseTTSEngine):
                     except Exception:
                         pass
 
-    @staticmethod
-    def _concat_wav_files(
-        wav_files: List[str],
-        output_path: str,
-        pause_seconds: float = DEFAULT_SENTENCE_PAUSE_SECONDS,
-    ) -> None:
-        """
-        Concatena múltiplos arquivos WAV em um único arquivo de saída.
-        Insere um silêncio acústico suave (pause_seconds) entre os blocos
-        para reproduzir fielmente os respiros contemplativos da voz original.
-        """
-        import numpy as np
-
-        if not wav_files:
-            return
-        if len(wav_files) == 1:
-            shutil.copyfile(wav_files[0], output_path)
-            return
-
-        all_audio: List[Any] = []
-        target_sr: Optional[int] = None
-
-        for wf in wav_files:
-            try:
-                data, sr = sf.read(wf, dtype="float32")
-                if target_sr is None:
-                    target_sr = sr
-                elif sr != target_sr:
-                    # Resample simples se sample rates diferirem
-                    logger.warning(
-                        "Sample rate diferente em chunk (%d vs %d). Usando o primeiro.", sr, target_sr
-                    )
-                if data.ndim > 1:
-                    data = data.mean(axis=1)  # Converte stereo para mono
-                all_audio.append(data)
-            except Exception as e:
-                logger.warning("Erro ao ler chunk WAV '%s': %s. Ignorando.", wf, e)
-
-        if not all_audio or target_sr is None:
-            raise RuntimeError("Nenhum chunk de áudio válido para concatenar.")
-
-        # Inserção da pausa de silêncio calibrada entre as sentenças
-        silence_samples = int(max(0.0, pause_seconds) * target_sr)
-        silence_gap = np.zeros(silence_samples, dtype=np.float32) if silence_samples > 0 else None
-
-        combined_parts = []
-        for i, arr in enumerate(all_audio):
-            combined_parts.append(arr)
-            if silence_gap is not None and i < len(all_audio) - 1:
-                combined_parts.append(silence_gap)
-
-        combined = np.concatenate(combined_parts)
-        sf.write(output_path, combined, target_sr)
-
     def clone_and_synthesize(
         self,
         text: str,
@@ -1081,6 +1084,88 @@ class IndexTTS2Engine(BaseTTSEngine):
                 "ou utilize o motor padrão F5-TTS."
             )
 
+    def _synthesize_single_sentence(
+        self,
+        text: str,
+        reference_audio_path: str,
+        output_path: str,
+    ) -> None:
+        """
+        Sintetiza uma única sentença como uma oração acústica atômica,
+        sem quebras artificiais internas de vírgula ou hífen.
+        """
+        target_text = text.strip()
+        if target_text and not target_text.endswith((".", "!", "?", "...", ":")):
+            target_text += "."
+
+        # max_text_tokens_per_segment=220: Garante que orações longas complexas
+        # (ex: 60+ palavras com múltiplas vírgulas) não sejam fatiadas no meio,
+        # eliminando pausas duplas em conjunções ("and,") e preservando o timbre
+        # natural e fluido do modelo autorregressivo sem crepitação ou rouquidão.
+        self.model.infer(
+            spk_audio_prompt=reference_audio_path,
+            text=target_text,
+            output_path=output_path,
+            interval_silence=0,
+            num_beams=1,
+            do_sample=True,
+            top_p=0.8,
+            top_k=30,
+            temperature=0.8,
+            max_text_tokens_per_segment=220,
+            verbose=False,
+        )
+
+    def _synthesize_multi_sentence(
+        self,
+        sentences: List[str],
+        reference_audio_path: str,
+        output_path: str,
+        pause_seconds: float = DEFAULT_SENTENCE_PAUSE_SECONDS,
+    ) -> None:
+        """
+        Sintetiza múltiplas sentenças individualmente e concatena-as com
+        silêncio de respiro calibrado (pause_seconds) entre cada frase.
+        """
+        out_path = Path(output_path).resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        chunk_wav_files: List[str] = []
+        total_sents = len(sentences)
+
+        logger.info(
+            "IndexTTS-2 síntese por sentenças ativada: %d sentenças (pausa entre frases: %.2fs)",
+            total_sents, pause_seconds,
+        )
+
+        try:
+            for i, sent_text in enumerate(sentences, 1):
+                chunk_wav = str(out_path.parent / f"{out_path.stem}_sent_{i:03d}.wav")
+                logger.info(
+                    "  [IndexTTS-2] Sentença %d/%d (%d chars): '%s...'",
+                    i, total_sents, len(sent_text), sent_text[:60],
+                )
+                self._synthesize_single_sentence(
+                    text=sent_text,
+                    reference_audio_path=reference_audio_path,
+                    output_path=chunk_wav,
+                )
+                chunk_wav_files.append(chunk_wav)
+
+            # Concatena todos os arquivos WAV inserindo a pausa exata entre as sentenças
+            self._concat_wav_files(chunk_wav_files, str(out_path), pause_seconds=pause_seconds)
+            logger.info(
+                "IndexTTS-2 síntese multi-sentença concluída: %d sentenças em %s (%.1fs)",
+                total_sents, out_path.name, get_audio_duration(str(out_path)),
+            )
+        finally:
+            # Limpa arquivos intermediários das sentenças
+            for cf in chunk_wav_files:
+                if os.path.isfile(cf):
+                    try:
+                        os.remove(cf)
+                    except Exception:
+                        pass
+
     def clone_and_synthesize(
         self,
         text: str,
@@ -1090,10 +1175,13 @@ class IndexTTS2Engine(BaseTTSEngine):
         reference_text: Optional[str] = None,
         auto_unload: bool = False,
         speed: float = 1.0,
+        sentence_pause_seconds: float = DEFAULT_SENTENCE_PAUSE_SECONDS,
         **kwargs: Any,
     ) -> ClonedAudioSegment:
         """
-        Sintetiza a fala clonada usando a API oficial do IndexTTS-2 (infer).
+        Sintetiza a fala clonada usando a arquitetura de sentenças do IndexTTS-2.
+        Sentenças individuais são sintetizadas como unidades acústicas completas,
+        preservando a fluidez natural e eliminando pausas duplas em conjunções.
         """
         self.load_model()
         self._check_engine_available()
@@ -1101,24 +1189,21 @@ class IndexTTS2Engine(BaseTTSEngine):
         final_out = Path(output_path).resolve()
         final_out.parent.mkdir(parents=True, exist_ok=True)
 
-        target_text = sanitize_tts_text(text)
-        if target_text and not target_text.endswith((".", "!", "?", "...", ":")):
-            target_text += "."
+        pause_sec = kwargs.get("sentence_pause_seconds", sentence_pause_seconds)
+
+        clean_text = sanitize_tts_text(text)
+        if clean_text and not clean_text.endswith((".", "!", "?", "...", ":")):
+            clean_text += "."
+
+        sentences = split_text_into_sentences(clean_text)
+
+        # Determina caminho temporário para a síntese bruta (sem estiramento de tempo)
+        if final_out.name.endswith(".raw.wav"):
+            raw_temp_path = str(final_out)
+        else:
+            raw_temp_path = str(final_out.with_suffix(".raw.wav"))
 
         try:
-            # Mapeia sentence_pause_seconds → interval_silence (ms) do IndexTTS-2.
-            # O IndexTTS-2 gera pausas naturais internamente via GPT; interval_silence
-            # controla o espaçamento entre segmentos de texto (~80 tokens).
-            # Clamped entre 100-1200ms para manter naturalidade e pausas de respiração.
-            pause_sec = kwargs.get("sentence_pause_seconds", 0.8)
-            interval_silence_ms = max(200, min(1200, int(pause_sec * 1000)))
-
-            logger.info(
-                "IndexTTS-2 infer: interval_silence=%dms (de pause=%.2fs), texto=%d chars, target_dur=%s",
-                interval_silence_ms, pause_sec, len(target_text),
-                f"{target_duration:.2f}s" if target_duration else "None",
-            )
-
             try:
                 import torch
                 if torch.cuda.is_available():
@@ -1126,23 +1211,23 @@ class IndexTTS2Engine(BaseTTSEngine):
             except Exception:
                 pass
 
-            # num_beams=1: Elimina sobrecarga de memória (reduz pico de VRAM de ~8GB para ~6GB)
-            # e evita que a busca em feixe acelere artificialmente a fala comprimindo pausas.
-            # max_text_tokens_per_segment=60: Segmentos equilibrados (~15-20 palavras) que quebram
-            # perfeitamente em pausas de pontuação e respiram naturalmente como na voz original.
-            self.model.infer(
-                spk_audio_prompt=reference_audio_path,
-                text=target_text,
-                output_path=str(final_out),
-                interval_silence=interval_silence_ms,
-                num_beams=1,
-                do_sample=True,
-                top_p=0.8,
-                top_k=30,
-                temperature=0.8,
-                max_text_tokens_per_segment=60,
-                verbose=False,
-            )
+            if len(sentences) <= 1:
+                self._synthesize_single_sentence(
+                    text=clean_text,
+                    reference_audio_path=reference_audio_path,
+                    output_path=raw_temp_path,
+                )
+            else:
+                self._synthesize_multi_sentence(
+                    sentences=sentences,
+                    reference_audio_path=reference_audio_path,
+                    output_path=raw_temp_path,
+                    pause_seconds=pause_sec,
+                )
+
+            # Cópia para o arquivo final se forem caminhos diferentes
+            if Path(raw_temp_path).resolve() != final_out:
+                shutil.copyfile(raw_temp_path, str(final_out))
 
             try:
                 import torch
@@ -1155,22 +1240,19 @@ class IndexTTS2Engine(BaseTTSEngine):
             target_dur = target_duration or actual_dur
             speed_factor = 1.0
 
-            # Ajuste de duração via FFmpeg atempo para corresponder ao timing do SRT.
-            # O IndexTTS-2 tende a falar mais rápido que o ritmo original; o time-stretch
-            # desacelera o áudio para encaixar no slot de tempo do segmento SRT.
+            # Ajuste de duração via FFmpeg atempo para corresponder ao timing do SRT, se fornecido
             if target_duration and target_duration > 0 and actual_dur > 0:
                 ratio = actual_dur / target_duration
                 # Só aplica se a diferença for significativa (> 5%)
                 if abs(ratio - 1.0) > 0.05:
                     stretched_out = final_out.with_suffix(".stretched.wav")
                     speed_factor = adjust_audio_duration_ffmpeg(
-                        input_audio=str(final_out),
+                        input_audio=raw_temp_path,
                         output_audio=str(stretched_out),
                         target_duration=target_duration,
                         min_speed=0.65,  # Permite desacelerar até 0.65x
                         max_speed=1.40,  # Permite acelerar até 1.40x
                     )
-                    # Substitui o original pelo stretched
                     if stretched_out.is_file():
                         shutil.move(str(stretched_out), str(final_out))
                     actual_dur = get_audio_duration(str(final_out))

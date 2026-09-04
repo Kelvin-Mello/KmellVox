@@ -155,10 +155,12 @@ class TestVoiceClone(unittest.TestCase):
         # IndexTTS-2 instalado: sintetiza com clone_and_synthesize mockado
         out_seg_wav = os.path.join(self.temp_dir.name, "indextts2_out.wav")
 
-        def _fake_synthesize(audio_prompt, text, output_path):
+        def _fake_synthesize(*args, **kwargs):
             import soundfile as sf_real
             import numpy as np
-            sf_real.write(output_path, np.zeros(int(24000 * 3.0), dtype=np.float32), 24000)
+            out_p = kwargs.get("output_path") or (args[2] if len(args) > 2 else None)
+            if out_p:
+                sf_real.write(out_p, np.zeros(int(24000 * 3.0), dtype=np.float32), 24000)
 
         with patch.object(engine.model, "infer", side_effect=_fake_synthesize):
             cloned = engine.clone_and_synthesize(

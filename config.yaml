@@ -25,7 +25,7 @@ ui:
 audio_mastering:
   last_profile: Padrao_KmellVox
   last_speed: 1.0
-  tempo_calibration: 1.00
+  tempo_calibration: 1.0
   sentence_pause: 0.8
   profiles:
     Padrao_KmellVox:
