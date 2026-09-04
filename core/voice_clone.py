@@ -368,6 +368,57 @@ def split_text_into_sentences(text: str) -> List[str]:
     return [s.strip() for s in raw_sentences if s.strip()]
 
 
+def split_text_into_narrative_chunks(
+    text: str,
+    max_chars: int = 250,
+    min_chars: int = 80,
+) -> List[str]:
+    """
+    Divide o texto em blocos narrativos coesos (narrative chunks) agrupando
+    sentenças completas sem nunca particionar o interior de uma oração.
+
+    Por que blocos narrativos em vez de sentenças isoladas?
+    Modelos neurais autorregressivos (como o IndexTTS-2) sofrem anomalia de "cold-start"
+    quando recebem frases minúsculas isoladas (ex: "Listen closely." de apenas 4 tokens),
+    gerando hesitações acústicas artificiais e pausas internas indesejadas.
+
+    Por que não fatiar cegamente em tokens por vírgula?
+    Cortar dentro de orações causa pausas duplas em conjunções ("and,"), alteração de timbre
+    e quebras de cadência antinaturais.
+
+    Regras do Agrupamento Narrativo:
+    1. A fronteira de um chunk é SEMPRE o término de uma sentença (. ! ? ... :), NUNCA uma vírgula.
+    2. Frases curtas (< min_chars, como "Listen closely.") são agrupadas à próxima sentença.
+    3. Frases longas individuais (>= max_chars) formam um chunk autônomo e não são partidas.
+    4. Cada chunk acumula até ~max_chars (mantendo ~35-80 tokens de contexto acústico ideal).
+    """
+    sentences = split_text_into_sentences(text)
+    if not sentences:
+        return []
+
+    chunks: List[str] = []
+    current_sentences: List[str] = []
+    current_chars = 0
+
+    for s in sentences:
+        s_len = len(s)
+        if current_sentences and (current_chars + s_len + 1 > max_chars) and current_chars >= min_chars:
+            chunks.append(" ".join(current_sentences))
+            current_sentences = [s]
+            current_chars = s_len
+        else:
+            current_sentences.append(s)
+            current_chars += (s_len + 1) if current_chars > 0 else s_len
+
+    if current_sentences:
+        if chunks and current_chars < min_chars and (len(chunks[-1]) + current_chars + 1 <= max_chars + 100):
+            chunks[-1] = chunks[-1] + " " + " ".join(current_sentences)
+        else:
+            chunks.append(" ".join(current_sentences))
+
+    return chunks
+
+
 def split_text_into_chunks(text: str, max_chars: int = _MAX_CHUNK_CHARS) -> List[str]:
     """
     Divide um texto longo em chunks respeitando limites de sentenças.
@@ -1038,12 +1089,13 @@ class IndexTTS2Engine(BaseTTSEngine):
                     x[..., :prompt_len] = 0
                     if self_cfm.zero_prompt_speech_token:
                         mu[..., :prompt_len] = 0
+                    if inference_cfg_rate > 0:
+                        stacked_prompt_x = torch.cat([prompt_x, torch.zeros_like(prompt_x)], dim=0)
+                        stacked_style = torch.cat([style, torch.zeros_like(style)], dim=0)
+                        stacked_mu = torch.cat([mu, torch.zeros_like(mu)], dim=0)
                     for step in range(1, len(t_span)):
                         dt = t_span[step] - t_span[step - 1]
                         if inference_cfg_rate > 0:
-                            stacked_prompt_x = torch.cat([prompt_x, torch.zeros_like(prompt_x)], dim=0)
-                            stacked_style = torch.cat([style, torch.zeros_like(style)], dim=0)
-                            stacked_mu = torch.cat([mu, torch.zeros_like(mu)], dim=0)
                             stacked_x = torch.cat([x, x], dim=0)
                             stacked_t = torch.cat([t.unsqueeze(0), t.unsqueeze(0)], dim=0)
                             stacked_dphi_dt = self_cfm.estimator(
@@ -1116,55 +1168,64 @@ class IndexTTS2Engine(BaseTTSEngine):
             verbose=False,
         )
 
-    def _synthesize_multi_sentence(
+    def _synthesize_multi_chunk(
         self,
-        sentences: List[str],
+        chunks: List[str],
         reference_audio_path: str,
         output_path: str,
         pause_seconds: float = DEFAULT_SENTENCE_PAUSE_SECONDS,
     ) -> None:
         """
-        Sintetiza múltiplas sentenças individualmente e concatena-as com
-        silêncio de respiro calibrado (pause_seconds) entre cada frase.
+        Sintetiza múltiplos blocos narrativos individualmente e concatena-os com
+        silêncio de respiro calibrado (pause_seconds) entre cada bloco.
         """
         out_path = Path(output_path).resolve()
         out_path.parent.mkdir(parents=True, exist_ok=True)
         chunk_wav_files: List[str] = []
-        total_sents = len(sentences)
+        total_chunks = len(chunks)
 
         logger.info(
-            "IndexTTS-2 síntese por sentenças ativada: %d sentenças (pausa entre frases: %.2fs)",
-            total_sents, pause_seconds,
+            "IndexTTS-2 síntese narrativa ativada: %d blocos (pausa entre blocos: %.2fs)",
+            total_chunks, pause_seconds,
         )
 
         try:
-            for i, sent_text in enumerate(sentences, 1):
-                chunk_wav = str(out_path.parent / f"{out_path.stem}_sent_{i:03d}.wav")
+            for i, chunk_text in enumerate(chunks, 1):
+                chunk_wav = str(out_path.parent / f"{out_path.stem}_chunk_{i:03d}.wav")
                 logger.info(
-                    "  [IndexTTS-2] Sentença %d/%d (%d chars): '%s...'",
-                    i, total_sents, len(sent_text), sent_text[:60],
+                    "  [IndexTTS-2] Bloco %d/%d (%d chars): '%s...'",
+                    i, total_chunks, len(chunk_text), chunk_text[:60],
                 )
                 self._synthesize_single_sentence(
-                    text=sent_text,
+                    text=chunk_text,
                     reference_audio_path=reference_audio_path,
                     output_path=chunk_wav,
                 )
                 chunk_wav_files.append(chunk_wav)
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
-            # Concatena todos os arquivos WAV inserindo a pausa exata entre as sentenças
+            # Concatena todos os arquivos WAV inserindo a pausa exata entre os blocos
             self._concat_wav_files(chunk_wav_files, str(out_path), pause_seconds=pause_seconds)
             logger.info(
-                "IndexTTS-2 síntese multi-sentença concluída: %d sentenças em %s (%.1fs)",
-                total_sents, out_path.name, get_audio_duration(str(out_path)),
+                "IndexTTS-2 síntese narrativa concluída: %d blocos em %s (%.1fs)",
+                total_chunks, out_path.name, get_audio_duration(str(out_path)),
             )
         finally:
-            # Limpa arquivos intermediários das sentenças
+            # Limpa arquivos intermediários dos blocos
             for cf in chunk_wav_files:
                 if os.path.isfile(cf):
                     try:
                         os.remove(cf)
                     except Exception:
                         pass
+
+    # Alias para retrocompatibilidade
+    _synthesize_multi_sentence = _synthesize_multi_chunk
 
     def clone_and_synthesize(
         self,
@@ -1179,9 +1240,9 @@ class IndexTTS2Engine(BaseTTSEngine):
         **kwargs: Any,
     ) -> ClonedAudioSegment:
         """
-        Sintetiza a fala clonada usando a arquitetura de sentenças do IndexTTS-2.
-        Sentenças individuais são sintetizadas como unidades acústicas completas,
-        preservando a fluidez natural e eliminando pausas duplas em conjunções.
+        Sintetiza a fala clonada usando a arquitetura de blocos narrativos do IndexTTS-2.
+        Blocos narrativos mantêm sentenças curtas e orações contextualmente ricas,
+        eliminando cold-start de frases minúsculas e preservando a cadência natural.
         """
         self.load_model()
         self._check_engine_available()
@@ -1195,7 +1256,7 @@ class IndexTTS2Engine(BaseTTSEngine):
         if clean_text and not clean_text.endswith((".", "!", "?", "...", ":")):
             clean_text += "."
 
-        sentences = split_text_into_sentences(clean_text)
+        chunks = split_text_into_narrative_chunks(clean_text)
 
         # Determina caminho temporário para a síntese bruta (sem estiramento de tempo)
         if final_out.name.endswith(".raw.wav"):
@@ -1211,15 +1272,15 @@ class IndexTTS2Engine(BaseTTSEngine):
             except Exception:
                 pass
 
-            if len(sentences) <= 1:
+            if len(chunks) <= 1:
                 self._synthesize_single_sentence(
                     text=clean_text,
                     reference_audio_path=reference_audio_path,
                     output_path=raw_temp_path,
                 )
             else:
-                self._synthesize_multi_sentence(
-                    sentences=sentences,
+                self._synthesize_multi_chunk(
+                    chunks=chunks,
                     reference_audio_path=reference_audio_path,
                     output_path=raw_temp_path,
                     pause_seconds=pause_sec,

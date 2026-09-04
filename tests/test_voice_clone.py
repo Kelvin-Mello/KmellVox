@@ -287,6 +287,22 @@ class TestVoiceClone(unittest.TestCase):
         self.assertEqual(sents[1], "Segunda frase com pergunta?")
         self.assertEqual(sents[2], "Terceira exclamação!")
 
+    def test_split_text_into_narrative_chunks(self):
+        """Testa o agrupamento de sentenças em blocos narrativos sem fragmentar orações curtas."""
+        from core.voice_clone import split_text_into_narrative_chunks
+        
+        # Frase curta isolada
+        self.assertEqual(split_text_into_narrative_chunks("Listen closely."), ["Listen closely."])
+        
+        # Frases curtas agrupadas em bloco coeso
+        text = "Listen closely. If you stand in the heart of Boston today, you will hear the city."
+        chunks = split_text_into_narrative_chunks(text, max_chars=200, min_chars=50)
+        self.assertEqual(len(chunks), 1)
+        self.assertTrue(chunks[0].startswith("Listen closely. If you stand"))
+        
+        # Texto vazio
+        self.assertEqual(split_text_into_narrative_chunks(""), [])
+
     def test_concat_wav_files_with_pause(self):
         """Testa concatenação de WAVs inserindo silêncio de respiro entre blocos."""
         wav1 = os.path.join(self.temp_dir.name, "chunk1.wav")
