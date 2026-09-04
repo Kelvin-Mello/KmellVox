@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -38,7 +39,9 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSlider,
+    QSpinBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -191,6 +194,7 @@ class NarrationWorkerThread(QThread):
     job_error_signal = Signal(str, str)
     queue_completed_signal = Signal()
 
+
     def __init__(
         self,
         jobs: List[NarrationJob],
@@ -202,6 +206,8 @@ class NarrationWorkerThread(QThread):
         self.jobs = jobs
         self.engine = NarrationEngine(model_profile=model_profile, models_dir=models_dir)
 
+
+
     def run(self) -> None:
         for job in self.jobs:
             if self.engine.is_cancelled:
@@ -211,9 +217,16 @@ class NarrationWorkerThread(QThread):
                 self.progress_signal.emit(job.job_id, pct, msg)
 
             try:
-                outputs = self.engine.run(job, progress_callback=on_progress)
+                outputs = self.engine.run(
+                    job,
+                    progress_callback=on_progress,
+                )
                 self.job_finished_signal.emit(job.job_id, outputs)
             except Exception as e:
+                import traceback, logging
+                logging.getLogger("KmellVox.NarrationWorker").error(
+                    "Erro completo no job %s:\n%s", job.job_id, traceback.format_exc()
+                )
                 self.job_error_signal.emit(job.job_id, str(e))
 
         self.queue_completed_signal.emit()
@@ -245,6 +258,7 @@ class NarrationTab(QWidget):
         self.mastering_profiles = _load_mastering_profiles_from_config()
 
         self._init_ui()
+        self._refresh_engine_catalog()
         self._refresh_all_voices()
         self._load_last_used_profile()
 
@@ -292,7 +306,63 @@ class NarrationTab(QWidget):
 
     def _build_synthesis_tab(self, parent: QWidget) -> None:
         layout = QVBoxLayout(parent)
-        layout.setContentsMargins(4, 8, 4, 4)
+        layout.setContentsMargins(4, 6, 4, 4)
+        layout.setSpacing(8)
+
+        # Barra Compacta Superior: Motor TTS Ativo e Classificação por Hardware
+        engine_banner = QFrame()
+        engine_banner.setFixedHeight(44)
+        engine_banner.setStyleSheet("""
+            QFrame {
+                background-color: #1A1824;
+                border: 1px solid #8257E5;
+                border-radius: 6px;
+            }
+        """)
+        banner_layout = QHBoxLayout(engine_banner)
+        banner_layout.setContentsMargins(12, 0, 12, 0)
+        banner_layout.setSpacing(10)
+
+        lbl_engine_icon = QLabel("🎙️ Motor de IA:")
+        lbl_engine_icon.setStyleSheet("font-size: 13px; font-weight: 900; color: #FFFFFF; border: none; background: transparent;")
+        banner_layout.addWidget(lbl_engine_icon)
+
+        self.cb_tts_engine = QComboBox()
+        self.cb_tts_engine.setFixedHeight(30)
+        self.cb_tts_engine.setCursor(Qt.PointingHandCursor)
+        self.cb_tts_engine.setStyleSheet("""
+            QComboBox {
+                background-color: #27272A;
+                color: #04D361;
+                font-weight: 900;
+                font-size: 12px;
+                padding: 2px 10px;
+                border: 1px solid #8257E5;
+                border-radius: 6px;
+                min-width: 250px;
+            }
+        """)
+        self.cb_tts_engine.currentIndexChanged.connect(self._on_engine_changed)
+        banner_layout.addWidget(self.cb_tts_engine)
+
+        self.lbl_engine_badge = QLabel("🟢 Recomendado")
+        self.lbl_engine_badge.setFixedHeight(24)
+        self.lbl_engine_badge.setStyleSheet("""
+            background-color: #04D36122;
+            color: #04D361;
+            font-weight: bold;
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 5px;
+            border: 1px solid #04D36155;
+        """)
+        banner_layout.addWidget(self.lbl_engine_badge)
+
+        self.lbl_engine_desc = QLabel("F5-TTS v1 Base — Padrão oficial de alto desempenho e fidelidade.")
+        self.lbl_engine_desc.setStyleSheet("color: #A1A1AA; font-size: 11px; border: none; background: transparent;")
+        banner_layout.addWidget(self.lbl_engine_desc, stretch=1)
+
+        layout.addWidget(engine_banner, 0)
 
         splitter = QSplitter(Qt.Horizontal)
 
@@ -330,6 +400,8 @@ class NarrationTab(QWidget):
         self.txt_content.setPlaceholderText(
             "Cole aqui o seu texto puro para narração contínua ou o conteúdo de um arquivo .SRT..."
         )
+        self.txt_content.setMaximumHeight(115)
+        self.txt_content.setMinimumHeight(70)
         self.txt_content.textChanged.connect(self._on_text_changed)
         input_layout.addWidget(self.txt_content)
         left_layout.addWidget(input_group)
@@ -347,7 +419,7 @@ class NarrationTab(QWidget):
         row_voice.addWidget(self.cb_synthesis_voices, stretch=3)
 
         btn_refresh_v = QPushButton("🔄")
-        btn_refresh_v.setToolTip("Atualizar lista de vozes")
+        btn_refresh_v.setToolTip("Atualizar lista de vozes e motores")
         btn_refresh_v.setFixedSize(30, 30)
         btn_refresh_v.clicked.connect(self._refresh_all_voices)
         row_voice.addWidget(btn_refresh_v)
@@ -500,14 +572,73 @@ class NarrationTab(QWidget):
         mast_layout.addLayout(grid_params)
         left_layout.addWidget(mast_group)
 
-        # 5. Opções SRT e Destino
-        self.grp_srt_options = QGroupBox("Opções de Divisão (SRT)")
+        # 5. Opções de Legenda SRT (Modos e Intervalo de Blocos)
+        self.grp_srt_options = QGroupBox("5. Opções de Legenda SRT")
         srt_opt_layout = QVBoxLayout(self.grp_srt_options)
-        self.rb_srt_split = QRadioButton("Gerar áudios separados por trecho (ex: 001_trecho.mp3)")
+        srt_opt_layout.setSpacing(6)
+
+        self.lbl_srt_info = QLabel("⏱️ Legenda detectada: 0 blocos")
+        self.lbl_srt_info.setStyleSheet("color: #FFA200; font-weight: bold; font-size: 11px;")
+        srt_opt_layout.addWidget(self.lbl_srt_info)
+
+        # Modo de Exportação
+        srt_opt_layout.addWidget(QLabel("<b>Modo de Exportação:</b>"))
+        self.bg_export_mode = QButtonGroup(self)
         self.rb_srt_single = QRadioButton("Juntar tudo em um único áudio contínuo (com pausas do SRT)")
         self.rb_srt_single.setChecked(True)
-        srt_opt_layout.addWidget(self.rb_srt_split)
+        self.rb_srt_split = QRadioButton("Gerar áudios separados por trecho (ex: 001_trecho.mp3)")
+        self.bg_export_mode.addButton(self.rb_srt_single)
+        self.bg_export_mode.addButton(self.rb_srt_split)
         srt_opt_layout.addWidget(self.rb_srt_single)
+        srt_opt_layout.addWidget(self.rb_srt_split)
+
+        # Seleção de Blocos a Sintetizar
+        srt_opt_layout.addWidget(QLabel("<b>Blocos de Legenda a Sintetizar:</b>"))
+
+        self.bg_blocks_mode = QButtonGroup(self)
+        self.rb_blocks_all = QRadioButton("Todos os blocos do arquivo SRT")
+        self.rb_blocks_all.setChecked(True)
+        self.rb_blocks_all.toggled.connect(self._on_srt_blocks_mode_changed)
+        self.bg_blocks_mode.addButton(self.rb_blocks_all)
+        srt_opt_layout.addWidget(self.rb_blocks_all)
+
+        row_range = QHBoxLayout()
+        self.rb_blocks_range = QRadioButton("Intervalo:")
+        self.rb_blocks_range.toggled.connect(self._on_srt_blocks_mode_changed)
+        self.bg_blocks_mode.addButton(self.rb_blocks_range)
+        row_range.addWidget(self.rb_blocks_range)
+
+        row_range.addWidget(QLabel("De:"))
+        self.spin_block_from = QSpinBox()
+        self.spin_block_from.setRange(1, 9999)
+        self.spin_block_from.setValue(1)
+        self.spin_block_from.setEnabled(False)
+        self.spin_block_from.setFixedWidth(65)
+        row_range.addWidget(self.spin_block_from)
+
+        row_range.addWidget(QLabel("Até:"))
+        self.spin_block_to = QSpinBox()
+        self.spin_block_to.setRange(1, 9999)
+        self.spin_block_to.setValue(1)
+        self.spin_block_to.setEnabled(False)
+        self.spin_block_to.setFixedWidth(65)
+        row_range.addWidget(self.spin_block_to)
+        row_range.addStretch()
+        srt_opt_layout.addLayout(row_range)
+
+        row_custom = QHBoxLayout()
+        self.rb_blocks_custom = QRadioButton("Digitar blocos:")
+        self.rb_blocks_custom.setToolTip("Digite os números dos blocos desejados (ex: 1-5 ou 1, 3, 5-8 ou 12)")
+        self.rb_blocks_custom.toggled.connect(self._on_srt_blocks_mode_changed)
+        self.bg_blocks_mode.addButton(self.rb_blocks_custom)
+        row_custom.addWidget(self.rb_blocks_custom)
+
+        self.txt_blocks_custom = QLineEdit()
+        self.txt_blocks_custom.setPlaceholderText("Ex: 1-5 ou 1, 3, 7-10 ou 12")
+        self.txt_blocks_custom.setEnabled(False)
+        row_custom.addWidget(self.txt_blocks_custom)
+        srt_opt_layout.addLayout(row_custom)
+
         self.grp_srt_options.setVisible(False)
         left_layout.addWidget(self.grp_srt_options)
 
@@ -530,17 +661,50 @@ class NarrationTab(QWidget):
         dest_layout.addLayout(row_dest)
 
         self.chk_audio_subfolder = QCheckBox("Criar subpasta 'Áudio' dentro do destino")
+        self.chk_audio_subfolder.setChecked(True)
         dest_layout.addWidget(self.chk_audio_subfolder)
+
+        self.chk_export_raw_wav = QCheckBox("Salvar também Áudio Bruto (.wav neural puro sem efeitos)")
+        self.chk_export_raw_wav.setChecked(True)
+        self.chk_export_raw_wav.setToolTip("Exporta cópia fiel do áudio direto da rede neural (.wav) ao lado do MP3 masterizado para comparação A/B.")
+        dest_layout.addWidget(self.chk_export_raw_wav)
         left_layout.addWidget(dest_group)
 
-        # Botão Adicionar à Fila
-        self.btn_add_to_queue = QPushButton("➕ Adicionar à Fila de Narração")
-        self.btn_add_to_queue.setFixedHeight(38)
-        self.btn_add_to_queue.setStyleSheet("background-color: #8257E5; color: white; font-weight: bold;")
-        self.btn_add_to_queue.clicked.connect(self._add_current_to_queue)
-        left_layout.addWidget(self.btn_add_to_queue)
+        # Contêiner da Coluna Esquerda: QScrollArea fluida + Botão Fixo no Rodapé
+        left_container = QWidget()
+        left_container_layout = QVBoxLayout(left_container)
+        left_container_layout.setContentsMargins(0, 0, 0, 0)
+        left_container_layout.setSpacing(6)
 
-        splitter.addWidget(left_widget)
+        # Envolve as opções em uma QScrollArea fluida para garantir que
+        # a janela nunca cresça verticalmente fora da tela ao abrir blocos SRT ou em telas menores.
+        scroll_left = QScrollArea()
+        scroll_left.setWidgetResizable(True)
+        scroll_left.setFrameShape(QFrame.NoFrame)
+        scroll_left.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_left.setWidget(left_widget)
+        left_container_layout.addWidget(scroll_left, stretch=1)
+
+        # Botão Adicionar à Fila: FIXO no rodapé da coluna de configuração (nunca some nem rola para fora!)
+        self.btn_add_to_queue = QPushButton("➕ Adicionar à Fila de Narração")
+        self.btn_add_to_queue.setFixedHeight(42)
+        self.btn_add_to_queue.setStyleSheet("""
+            QPushButton {
+                background-color: #8257E5;
+                color: #FFFFFF;
+                font-size: 13px;
+                font-weight: 900;
+                border-radius: 6px;
+                padding: 0 16px;
+            }
+            QPushButton:hover {
+                background-color: #9466FF;
+            }
+        """)
+        self.btn_add_to_queue.clicked.connect(self._add_current_to_queue)
+        left_container_layout.addWidget(self.btn_add_to_queue)
+
+        splitter.addWidget(left_container)
 
         # -----------------------------
         # Coluna Direita: Fila e Execução
@@ -581,11 +745,14 @@ class NarrationTab(QWidget):
         self.table_queue.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.table_queue.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table_queue.setAlternatingRowColors(True)
+        self.table_queue.setMinimumHeight(120)
         right_layout.addWidget(self.table_queue)
 
         # Painel de Progresso
         prog_box = QGroupBox("Status de Processamento")
         prog_box_layout = QVBoxLayout(prog_box)
+        prog_box_layout.setContentsMargins(8, 6, 8, 6)
+        prog_box_layout.setSpacing(4)
         self.lbl_job_stage = QLabel("Etapa Atual: Ocioso")
         self.lbl_job_stage.setStyleSheet("color: #04D361; font-weight: 500;")
         prog_box_layout.addWidget(self.lbl_job_stage)
@@ -593,7 +760,7 @@ class NarrationTab(QWidget):
         self.prog_bar = QProgressBar()
         self.prog_bar.setRange(0, 100)
         self.prog_bar.setValue(0)
-        self.prog_bar.setFixedHeight(20)
+        self.prog_bar.setFixedHeight(18)
         prog_box_layout.addWidget(self.prog_bar)
         right_layout.addWidget(prog_box)
 
@@ -612,8 +779,10 @@ class NarrationTab(QWidget):
         right_layout.addLayout(exec_layout)
 
         splitter.addWidget(right_widget)
-        splitter.setSizes([540, 560])
-        layout.addWidget(splitter)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([650, 430])
+        layout.addWidget(splitter, 1)
 
     # -----------------------------------------------------------------------
     # SUB-ABA 2: CLONAGEM E GERENCIAMENTO DE VOZES
@@ -623,6 +792,29 @@ class NarrationTab(QWidget):
         layout = QVBoxLayout(parent)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(12)
+
+        # Banner Informativo de Arquitetura de Clonagem
+        info_box = QGroupBox("ℹ️ Como Funciona a Clonagem e Seleção de Modelos no KmellVox")
+        info_box.setStyleSheet("""
+            QGroupBox {
+                background-color: #18181B;
+                border: 1px solid #27272A;
+                border-radius: 8px;
+                padding: 8px 12px;
+            }
+        """)
+        info_layout = QVBoxLayout(info_box)
+        info_layout.setSpacing(4)
+        lbl_info = QLabel(
+            "<b>Como o KmellVox clona e gera vozes:</b><br>"
+            "• <b>Nesta Aba (Clonagem):</b> Você cadastra as vozes desejadas. O sistema extrai e calibra uma amostra limpa (de 8 a 12s) que serve como o <b>DNA vocal</b>.<br>"
+            "• <b>Na Aba 'Síntese de Narração':</b> Você escolhe no topo da tela qual <b>Motor TTS</b> (ex: F5-TTS, IndexTTS-2.5, Qwen3) usará esse DNA para ler seu roteiro em tempo real.<br>"
+            "• Qualquer voz cadastrada aqui pode ser utilizada instantaneamente por qualquer um dos motores instalados!"
+        )
+        lbl_info.setWordWrap(True)
+        lbl_info.setStyleSheet("color: #D4D4D8; font-size: 12px; line-height: 140%;")
+        info_layout.addWidget(lbl_info)
+        layout.addWidget(info_box)
 
         # Bloco Superior: Clonar Nova Voz
         clone_box = QGroupBox("🧬 Clonar e Adicionar Nova Voz")
@@ -746,13 +938,13 @@ class NarrationTab(QWidget):
         self.lbl_lufs_val.setText(f"{lufs} LUFS")
 
     def _get_current_mastering_config(self) -> AudioMasteringConfig:
-        tempo_calib = 1.15
+        tempo_calib = 1.00
         try:
             cfg_p = _get_config_path()
             if cfg_p.exists():
                 with open(cfg_p, "r", encoding="utf-8") as f:
                     c = yaml.safe_load(f) or {}
-                tempo_calib = float(c.get("audio_mastering", {}).get("tempo_calibration", 1.15))
+                tempo_calib = float(c.get("audio_mastering", {}).get("tempo_calibration", 1.00))
         except Exception:
             pass
 
@@ -949,10 +1141,93 @@ class NarrationTab(QWidget):
 
     def _check_preset_voices(self) -> None:
         """Compatibilidade com chamadas de atualização do MainWindow."""
+        self._refresh_engine_catalog()
         self._refresh_all_voices()
+
+    def _refresh_engine_catalog(self) -> None:
+        """Atualiza a lista de motores TTS disponíveis com badges de compatibilidade por hardware."""
+        if not hasattr(self, "cb_tts_engine"):
+            return
+        try:
+            from core.hardware import detect_hardware
+            from core.tts_catalog import list_tts_catalog, get_hardware_compatibility
+            hw = detect_hardware()
+            vram = hw.vram_total_gb if hw.cuda_available else 0.0
+
+            cur_data = self.cb_tts_engine.currentData()
+            self.cb_tts_engine.clear()
+
+            from core.tts_catalog import is_engine_operational
+            for meta in list_tts_catalog():
+                is_op, op_exp = is_engine_operational(meta.id)
+                badge, explanation = get_hardware_compatibility(meta.id, vram)
+                if not is_op:
+                    label = f"{meta.name} [⚪ Em Breve]"
+                else:
+                    label = f"{meta.name} [{badge}]"
+                self.cb_tts_engine.addItem(label, meta.id)
+                idx = self.cb_tts_engine.count() - 1
+                self.cb_tts_engine.setItemData(idx, f"{meta.description}\n\nStatus: {op_exp}\nCompatibilidade: {explanation}", Qt.ToolTipRole)
+
+            if cur_data:
+                idx = self.cb_tts_engine.findData(cur_data)
+                if idx >= 0:
+                    self.cb_tts_engine.setCurrentIndex(idx)
+            else:
+                f5_idx = self.cb_tts_engine.findData("f5-tts")
+                if f5_idx >= 0:
+                    self.cb_tts_engine.setCurrentIndex(f5_idx)
+
+            self._on_engine_changed()
+        except Exception as e:
+            logger.warning("Falha ao carregar catálogo de motores TTS na UI: %s", e)
+
+    def _on_engine_changed(self, idx: int = 0) -> None:
+        """Atualiza dinamicamente os badges e a descrição do motor selecionado."""
+        if not hasattr(self, "cb_tts_engine") or not hasattr(self, "lbl_engine_badge"):
+            return
+        try:
+            from core.hardware import detect_hardware
+            from core.tts_catalog import get_engine_meta, get_hardware_compatibility, is_engine_operational
+            engine_id = self.cb_tts_engine.currentData()
+            if not engine_id:
+                return
+            meta = get_engine_meta(engine_id)
+            if meta:
+                hw = detect_hardware()
+                vram = hw.vram_total_gb if hw.cuda_available else 0.0
+                is_op, op_exp = is_engine_operational(meta.id)
+                badge, exp = get_hardware_compatibility(meta.id, vram)
+                if not is_op:
+                    badge = "⚪ Em Breve"
+                    exp = op_exp
+
+                if "Pouco" in badge or "🟡" in badge:
+                    self.lbl_engine_badge.setStyleSheet(
+                        "background-color: transparent; color: #FFA200; font-weight: bold; font-size: 11px; padding: 2px 4px; border: none;"
+                    )
+                elif "Não" in badge or "🔴" in badge:
+                    self.lbl_engine_badge.setStyleSheet(
+                        "background-color: transparent; color: #FF5555; font-weight: bold; font-size: 11px; padding: 2px 4px; border: none;"
+                    )
+                elif "Breve" in badge or "⚪" in badge:
+                    self.lbl_engine_badge.setStyleSheet(
+                        "background-color: transparent; color: #A1A1AA; font-weight: bold; font-size: 11px; padding: 2px 4px; border: none;"
+                    )
+                else:
+                    self.lbl_engine_badge.setStyleSheet(
+                        "background-color: #04D36122; color: #04D361; font-weight: bold; font-size: 11px; padding: 2px 8px; border-radius: 5px; border: 1px solid #04D36155;"
+                    )
+                self.lbl_engine_badge.setText(badge)
+                self.lbl_engine_desc.setText(f"{meta.description} ({exp})")
+                if hasattr(self, "btn_add_to_queue"):
+                    self.btn_add_to_queue.setText(f"➕ Adicionar à Fila (Motor: {meta.name})")
+        except Exception as e:
+            logger.warning("Falha ao atualizar visual do motor selecionado: %s", e)
 
     def _refresh_all_voices(self) -> None:
         """Recarrega a lista de vozes da pasta voices/ e atualiza ambas as sub-abas."""
+        self._refresh_engine_catalog()
         voices = list_all_saved_voices()
 
         # 1. Atualiza ComboBox da Sub-Aba 1 (Síntese)
@@ -1077,6 +1352,16 @@ class NarrationTab(QWidget):
     # OPERAÇÕES DE NARRAÇÃO, FILA E EXECUÇÃO
     # -----------------------------------------------------------------------
 
+    def _on_srt_blocks_mode_changed(self) -> None:
+        """Controla a habilitação dos campos de intervalo de blocos SRT."""
+        if not hasattr(self, "rb_blocks_range"):
+            return
+        is_range = self.rb_blocks_range.isChecked()
+        is_custom = self.rb_blocks_custom.isChecked()
+        self.spin_block_from.setEnabled(is_range)
+        self.spin_block_to.setEnabled(is_range)
+        self.txt_blocks_custom.setEnabled(is_custom)
+
     def _on_text_changed(self) -> None:
         text = self.txt_content.toPlainText()
         fmt = detect_text_format(text)
@@ -1084,6 +1369,16 @@ class NarrationTab(QWidget):
             self.lbl_format_detected.setText("⏱️ Formato detectado: Legenda (.srt)")
             self.lbl_format_detected.setStyleSheet("color: #FFA200; font-weight: bold;")
             self.grp_srt_options.setVisible(True)
+
+            # Analisa quantidade de blocos detectados
+            from core.narration import parse_srt
+            segs = parse_srt(text)
+            total = len(segs)
+            self.lbl_srt_info.setText(f"⏱️ Legenda detectada: {total} bloco(s) de áudio")
+            self.spin_block_from.setRange(1, max(1, total))
+            self.spin_block_to.setRange(1, max(1, total))
+            if not self.rb_blocks_range.isChecked() and not self.rb_blocks_custom.isChecked():
+                self.spin_block_to.setValue(max(1, total))
         else:
             self.lbl_format_detected.setText("📄 Formato detectado: Texto Puro (.txt)")
             self.lbl_format_detected.setStyleSheet("color: #04D361; font-weight: bold;")
@@ -1166,9 +1461,42 @@ class NarrationTab(QWidget):
         save_source = self.chk_save_source_dir.isChecked() and self.chk_save_source_dir.isEnabled()
         dest_dir = self.txt_dest_folder.text().strip() or str(Path.home() / "Downloads")
 
+        srt_range_str: Optional[str] = None
+        if fmt == "srt":
+            if hasattr(self, "rb_blocks_range") and self.rb_blocks_range.isChecked():
+                b_from = self.spin_block_from.value()
+                b_to = self.spin_block_to.value()
+                srt_range_str = f"{b_from}-{b_to}"
+            elif hasattr(self, "rb_blocks_custom") and self.rb_blocks_custom.isChecked():
+                srt_range_str = self.txt_blocks_custom.text().strip() or None
+
         speed = self.slider_speed.value() / 100.0
         pause_sec = self.slider_pause.value() / 100.0
         mastering_cfg = self._get_current_mastering_config()
+        selected_engine = self.cb_tts_engine.currentData() if hasattr(self, "cb_tts_engine") and self.cb_tts_engine.currentData() else "f5-tts"
+
+        from core.tts_catalog import get_engine_meta, is_engine_operational
+        is_op, op_exp = is_engine_operational(selected_engine)
+        if not is_op:
+            meta = get_engine_meta(selected_engine)
+            meta_name = meta.name if meta else selected_engine
+            ans = QMessageBox.question(
+                self,
+                "Motor TTS Não Operacional",
+                f"O motor selecionado '{meta_name}' não está pronto para execução imediata neste ambiente:\n\n"
+                f"• {op_exp}\n\n"
+                f"Deseja alternar automaticamente para o motor padrão F5-TTS v1 Base [🟢 Operacional]?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if ans == QMessageBox.Yes:
+                selected_engine = "f5-tts"
+                f5_idx = self.cb_tts_engine.findData("f5-tts")
+                if f5_idx >= 0:
+                    self.cb_tts_engine.setCurrentIndex(f5_idx)
+            else:
+                return
+
+        export_raw = self.chk_export_raw_wav.isChecked() if hasattr(self, "chk_export_raw_wav") else True
 
         job_id = f"narr_job_{int(time.time() * 1000)}_{len(self.queue_jobs)}"
         job = NarrationJob(
@@ -1178,10 +1506,13 @@ class NarrationTab(QWidget):
             source_file_path=self.current_source_file_path,
             voice_mode="clone",
             reference_audio_path=ref_audio,
+            selected_engine=selected_engine,
             split_mode=split_mode,
+            srt_range=srt_range_str,
             speech_speed=speed,
             sentence_pause_seconds=pause_sec,
             mastering_config=mastering_cfg,
+            export_raw_wav=export_raw,
             destination_folder=dest_dir,
             save_to_source_folder=save_source,
             create_audio_subfolder=self.chk_audio_subfolder.isChecked(),
@@ -1189,7 +1520,8 @@ class NarrationTab(QWidget):
 
         self.queue_jobs[job_id] = job
         self._insert_job_row(job)
-        self.log_signal.emit(f"Item adicionado à fila: {job_id} ({fmt.upper()}, {speed:.2f}x)")
+        range_info = f", Blocos: {srt_range_str}" if srt_range_str else ""
+        self.log_signal.emit(f"Item adicionado à fila: {job_id} ({fmt.upper()}{range_info}, {speed:.2f}x, motor: {selected_engine})")
 
         # Aviso ao usuário quando a referência de voz é curta (< 8s)
         # Referências de 10-15s fornecem melhor fidelidade de clonagem no F5-TTS
@@ -1314,12 +1646,15 @@ class NarrationTab(QWidget):
         self.worker_thread.job_error_signal.connect(self._on_job_error)
         self.worker_thread.queue_completed_signal.connect(self._on_queue_completed)
 
+
         for job in pending:
             job.status = "Processando..."
             self._update_job_row(job.job_id)
 
         self.worker_thread.start()
         self.log_signal.emit(f"🚀 Fila iniciada com {len(pending)} tarefas.")
+
+
 
     def _update_job_row(self, job_id: str) -> None:
         for row in range(self.table_queue.rowCount()):
@@ -1356,11 +1691,19 @@ class NarrationTab(QWidget):
     def _on_job_error(self, job_id: str, err: str) -> None:
         if job_id in self.queue_jobs:
             job = self.queue_jobs[job_id]
-            job.status = f"Erro: {err[:25]}..."
+            job.status = f"Erro"
             self._update_job_row(job_id)
 
-        self.lbl_job_stage.setText(f"❌ Erro na narração: {err}")
+        self.lbl_job_stage.setText(f"❌ Erro na narração: {err[:80]}")
         self.log_signal.emit(f"❌ Erro na narração ({job_id}): {err}")
+
+        # Popup de notificação detalhada para o usuário
+        QMessageBox.critical(
+            self,
+            "Erro na Geração de Narração",
+            f"A operação de narração foi cancelada devido a um erro:\n\n{err}\n\n"
+            f"Verifique se o motor TTS selecionado está corretamente instalado e operacional.",
+        )
 
     def _on_queue_completed(self) -> None:
         self.btn_process_queue.setEnabled(True)

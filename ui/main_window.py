@@ -770,9 +770,16 @@ class MainWindow(QMainWindow):
         self.chk_burn_subs.setChecked(False)
         opts_layout.addWidget(self.chk_burn_subs)
 
+        row_engine = QHBoxLayout()
+        row_engine.addWidget(QLabel("Motor TTS:"))
+        self.cb_dubbing_engine = QComboBox()
+        self.cb_dubbing_engine.setFixedHeight(28)
+        self.cb_dubbing_engine.setCursor(Qt.PointingHandCursor)
+        row_engine.addWidget(self.cb_dubbing_engine)
+        opts_layout.addLayout(row_engine)
+
         self.chk_indextts2 = QCheckBox("Qualidade máxima de voz (IndexTTS-2)")
-        self.chk_indextts2.setChecked(False)
-        opts_layout.addWidget(self.chk_indextts2)
+        self.chk_indextts2.setVisible(False)
 
         rhythm_box = QGroupBox("Controle de Ritmo (Ajuste de Fala)")
         rhythm_layout = QVBoxLayout(rhythm_box)
@@ -913,6 +920,29 @@ class MainWindow(QMainWindow):
             self.badge_hardware.setText(f"💻 {display} ({hw.cpu_cores} cores)")
             self.badge_hardware.setStyleSheet("background-color: #383840; color: #FFA200; padding: 5px 12px; border-radius: 12px;")
 
+        # Popula seletor de motores TTS da dublagem
+        try:
+            from core.tts_catalog import list_tts_catalog, get_hardware_compatibility
+            vram = hw.vram_total_gb if hw.cuda_available else 0.0
+            cur_eng = self.cb_dubbing_engine.currentData()
+            self.cb_dubbing_engine.clear()
+            for meta in list_tts_catalog():
+                badge, exp = get_hardware_compatibility(meta.id, vram)
+                self.cb_dubbing_engine.addItem(f"{meta.name} [{badge}]", meta.id)
+                idx = self.cb_dubbing_engine.count() - 1
+                self.cb_dubbing_engine.setItemData(idx, f"{meta.description}\n\n{exp}", Qt.ToolTipRole)
+
+            if cur_eng:
+                idx = self.cb_dubbing_engine.findData(cur_eng)
+                if idx >= 0:
+                    self.cb_dubbing_engine.setCurrentIndex(idx)
+            else:
+                f5_idx = self.cb_dubbing_engine.findData("f5-tts")
+                if f5_idx >= 0:
+                    self.cb_dubbing_engine.setCurrentIndex(f5_idx)
+        except Exception as e:
+            logger.warning("Falha ao atualizar catálogo de motores na dublagem: %s", e)
+
         if hw.model_profile.enable_indextts_2:
             self.chk_indextts2.setEnabled(True)
             self.chk_indextts2.setToolTip("IndexTTS-2 em FP16 com controle nativo de duração (Habilitado para Alta Performance, 8GB+ VRAM).")
@@ -969,7 +999,7 @@ class MainWindow(QMainWindow):
                     source_lang="auto",
                     target_lang=lang,
                     enable_lipsync=self.chk_lipsync.isChecked() and not is_raw_only,
-                    use_indextts2=self.chk_indextts2.isChecked(),
+                    use_indextts2=(self.cb_dubbing_engine.currentData() == "indextts-2") if hasattr(self, "cb_dubbing_engine") else self.chk_indextts2.isChecked(),
                     burn_subtitles=self.chk_burn_subs.isChecked() and not is_raw_only,
                     export_raw=is_raw_only or export_both,
                 )

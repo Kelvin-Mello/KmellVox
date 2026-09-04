@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from .assemble import (
     AssemblyConfig,
     assemble_final_video,
+    build_timeline_audio,
     burn_subtitles,
     export_raw_package,
     mux_audio_video,
@@ -28,7 +29,7 @@ from .hardware import HardwareInfo, ModelProfile, detect_hardware
 from .lipsync import LipSyncEngine, LipSyncResult
 from .transcribe import Transcriber, TranscriptionSegment
 from .translate import TranslatedSegment, TranslationResult, Translator
-from .voice_clone import ClonedAudioSegment, get_tts_engine
+from .voice_clone import ClonedAudioSegment, get_audio_duration, get_tts_engine
 
 logger = logging.getLogger("KmellVox.Pipeline")
 
@@ -251,9 +252,17 @@ class DubPipeline:
                 progress_callback=on_voice_sub,
             )
 
-            # Áudio dublado mixado
+            # Áudio dublado mixado na timeline oficial a partir dos segmentos clonados
             dubbed_audio_path = str(job_work_dir / "final_dubbed_audio.wav")
-            if os.path.isfile(raw_audio_path):
+            if cloned_segments:
+                notify("voice_clone", 0.76, "Montando timeline do áudio dublado...")
+                media_duration = get_audio_duration(raw_audio_path)
+                build_timeline_audio(
+                    segments=cloned_segments,
+                    total_duration=media_duration,
+                    output_path=dubbed_audio_path,
+                )
+            elif os.path.isfile(raw_audio_path):
                 shutil.copyfile(raw_audio_path, dubbed_audio_path)
             else:
                 Path(dubbed_audio_path).touch()

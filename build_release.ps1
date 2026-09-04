@@ -47,7 +47,7 @@ if (Test-Path (Join-Path $DistDir "config.yaml")) {
 # 1. Faz backup dos modelos e pastas de runtime antes do --clean
 if ((Test-Path $ModelsInDist) -and -not (Test-Path $ModelsBackup)) {
     Write-Host "[1/4] Fazendo backup de models/ antes do build..." -ForegroundColor Yellow
-    Copy-Item -Path $ModelsInDist -Destination $ModelsBackup -Recurse -Force
+    Move-Item -Path $ModelsInDist -Destination $ModelsBackup -Force
     Write-Host "      Backup criado em: $ModelsBackup" -ForegroundColor Green
 } else {
     Write-Host "[1/4] Nenhum backup necessario para models/." -ForegroundColor Gray
@@ -86,8 +86,7 @@ if (-not $SkipModels) {
 
     if ($BackupHasContent) {
         if (Test-Path $ModelsInDist) { Remove-Item $ModelsInDist -Recurse -Force }
-        Copy-Item -Path $ModelsBackup -Destination $ModelsInDist -Recurse -Force
-        Remove-Item $ModelsBackup -Recurse -Force
+        Move-Item -Path $ModelsBackup -Destination $ModelsInDist -Force
         Write-Host "      models/ restaurados do backup." -ForegroundColor Green
     } elseif ($RepoHasContent) {
         if (Test-Path $ModelsInDist) { Remove-Item $ModelsInDist -Recurse -Force }

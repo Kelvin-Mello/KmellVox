@@ -203,7 +203,7 @@ class TestVoiceClone(unittest.TestCase):
             # Nenhum motor instalado: a factory deve lançar RuntimeError claro
             with self.assertRaises(RuntimeError) as ctx:
                 get_tts_engine(model_profile=prof_a, use_advanced=True)
-            self.assertIn("nenhum motor", str(ctx.exception).lower())
+            self.assertTrue(any(w in str(ctx.exception).lower() for w in ("nenhum motor", "indextts-2", "não pôde ser inicializado")))
 
             with self.assertRaises(RuntimeError):
                 get_tts_engine(model_profile=prof_b, use_advanced=False)

@@ -257,6 +257,34 @@ class TestNarrationCoreAndUI(unittest.TestCase):
         self.assertEqual(len(tab.queue_jobs), 0)
         self.assertEqual(tab.table_queue.rowCount(), 0)
 
+    def test_parse_block_ranges(self):
+        """Testa a função de interpretação de intervalos de blocos SRT."""
+        from core.narration import parse_block_ranges
+
+        # Vazio ou curinga -> todos
+        self.assertEqual(parse_block_ranges("", 5), [1, 2, 3, 4, 5])
+        self.assertEqual(parse_block_ranges("*", 5), [1, 2, 3, 4, 5])
+
+        # Intervalo simples
+        self.assertEqual(parse_block_ranges("1-3", 5), [1, 2, 3])
+        self.assertEqual(parse_block_ranges("2-4", 10), [2, 3, 4])
+
+        # Lista avulsa e mista
+        self.assertEqual(parse_block_ranges("1, 3, 5", 5), [1, 3, 5])
+        self.assertEqual(parse_block_ranges("1, 3-5, 8", 10), [1, 3, 4, 5, 8])
+
+        # Clamping aos limites
+        self.assertEqual(parse_block_ranges("8-20", 10), [8, 9, 10])
+
+    def test_splash_screen_initialization(self):
+        """Testa criação da Splash Screen moderna e atualização de status."""
+        from ui.splash_screen import KmellVoxSplashScreen
+        splash = KmellVoxSplashScreen()
+        self.assertIsNotNone(splash)
+        splash.set_status("Testando inicialização...", 50)
+        self.assertEqual(splash.lbl_percent.text(), "50%")
+        splash.close()
+
 
 if __name__ == "__main__":
     unittest.main()

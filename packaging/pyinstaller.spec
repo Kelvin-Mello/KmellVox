@@ -22,7 +22,7 @@ MODELS_BACKUP = PROJECT_ROOT / 'dist' / '_models_backup'
 
 if MODELS_IN_DIST.exists() and not MODELS_BACKUP.exists():
     print(f"[SPEC] Fazendo backup de models/ antes do --clean: {MODELS_BACKUP}")
-    shutil.copytree(str(MODELS_IN_DIST), str(MODELS_BACKUP))
+    shutil.move(str(MODELS_IN_DIST), str(MODELS_BACKUP))
 
 datas = [
     (str(PROJECT_ROOT / 'config.yaml'), '.'),
@@ -78,6 +78,7 @@ hiddenimports = [
     'core.narration',
     'core.safe_streams',
     'core.dependency_manager',
+    'core.tts_catalog',
     'downloader',
     'downloader.fetch_models',
     'ui',
@@ -85,6 +86,7 @@ hiddenimports = [
     'ui.queue_widget',
     'ui.settings_dialog',
     'ui.narration_tab',
+    'ui.splash_screen',
 ]
 
 # Adiciona submódulos dinâmicos de bibliotecas que utilizam lazy-loading
@@ -173,8 +175,7 @@ if MODELS_BACKUP.exists():
     if MODELS_DEST.exists():
         shutil.rmtree(str(MODELS_DEST))
     print(f"[SPEC] Restaurando models/ do backup: {MODELS_BACKUP} -> {MODELS_DEST}")
-    shutil.copytree(str(MODELS_BACKUP), str(MODELS_DEST))
-    shutil.rmtree(str(MODELS_BACKUP))
+    shutil.move(str(MODELS_BACKUP), str(MODELS_DEST))
     print("[SPEC] models/ restaurados com sucesso. Backup temporário removido.")
 elif not MODELS_DEST.exists():
     print("[SPEC] Aviso: nenhum backup de models/ encontrado. Pasta models/ está vazia.")

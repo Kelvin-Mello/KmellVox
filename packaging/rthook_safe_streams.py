@@ -3,6 +3,13 @@
 import os
 import sys
 
+# CRITICAL: Desabilita TorchScript JIT no executável congelado.
+# TorchScript precisa de código-fonte .py para compilar @torch.jit.script,
+# mas PyInstaller embute apenas .pyc. PYTORCH_JIT=0 torna o decorador um no-op.
+# DEVE estar antes de qualquer import do torch (inclusive indireto).
+os.environ["PYTORCH_JIT"] = "0"
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 
 class SafeStream:
     def write(self, text: str) -> int:

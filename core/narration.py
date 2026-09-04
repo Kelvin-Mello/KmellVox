@@ -112,6 +112,44 @@ def parse_srt(text: str) -> List[TranscriptionSegment]:
     return segments
 
 
+def parse_block_ranges(range_str: str, max_blocks: int) -> List[int]:
+    """
+    Interpreta uma string de seleção de blocos de legenda (ex: "1-5", "1, 3, 5-8", "10")
+    e retorna a lista ordenada de índices (1-indexed) válidos.
+    Se range_str estiver vazio ou contiver '*', retorna todos os blocos de 1 a max_blocks.
+    """
+    clean = range_str.strip() if range_str else ""
+    if not clean or clean == "*":
+        return list(range(1, max_blocks + 1))
+
+    selected = set()
+    parts = clean.split(",")
+    for part in parts:
+        p = part.strip()
+        if not p:
+            continue
+        if "-" in p:
+            sub = p.split("-")
+            if len(sub) == 2:
+                try:
+                    start_i = max(1, int(sub[0].strip()))
+                    end_i = min(max_blocks, int(sub[1].strip()))
+                    if start_i <= end_i:
+                        selected.update(range(start_i, end_i + 1))
+                except ValueError:
+                    pass
+        else:
+            try:
+                val = int(p)
+                if 1 <= val <= max_blocks:
+                    selected.add(val)
+            except ValueError:
+                pass
+
+    res = sorted(list(selected))
+    return res if res else list(range(1, max_blocks + 1))
+
+
 def slugify_text(text: str, max_words: int = 4, max_len: int = 30) -> str:
     """Gera um slug curto e limpo a partir das primeiras palavras do texto para nomes de arquivos."""
     # Remove acentos
@@ -125,58 +163,51 @@ def slugify_text(text: str, max_words: int = 4, max_len: int = 30) -> str:
 def list_preset_voices(
     model_profile: Optional[ModelProfile] = None,
     models_dir: str = "models",
-) -> List[Dict[str, str]]:
+) -> List[Dict[str, Any]]:
     """
-    Verifica se existem áudios de exemplo / vozes pré-definidas na pasta de pesos do modelo
-    ou diretórios de presets do projeto.
-    
-    Retorna lista de dicionários com: [{"id": str, "label": str, "audio_path": str}]
-    Se nenhum áudio pronto for encontrado, retorna uma lista vazia ([]).
+    Varre os diretórios de vozes procurando referências de áudio válidas (.wav, .mp3, .ogg, .flac).
+    Retorna metadados para popular a UI com vozes pré-definidas.
     """
     candidate_paths: List[Path] = [
+        get_voices_directory(models_dir),
         Path(models_dir).resolve() / "tts" / "presets",
         Path(models_dir).resolve() / "tts" / "samples",
         Path(models_dir).resolve() / "presets",
         Path(models_dir).resolve() / "voices",
-        Path("presets").resolve(),
     ]
-
-    # Pasta voices/ da raiz do app — onde o botão "Salvar como Preset" copia os arquivos.
-    # Funciona tanto no executável empacotado (PyInstaller) quanto no modo desenvolvimento.
-    if getattr(sys, "frozen", False):
-        _app_voices = Path(sys.executable).parent / "voices"
-    else:
-        _app_voices = Path(__file__).parent.parent / "voices"
-    candidate_paths.append(_app_voices)
-
-
-    # Procura também na pasta de instalação do F5-TTS / IndexTTS se existir
-    try:
-        import f5_tts
-        f5_pkg_dir = Path(f5_tts.__file__).parent
-        candidate_paths.append(f5_pkg_dir / "infer" / "examples")
-        candidate_paths.append(f5_pkg_dir / "examples")
-    except Exception:
-        pass
-
-    valid_exts = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
-    discovered_voices: List[Dict[str, str]] = []
+    discovered_voices: List[Dict[str, Any]] = []
     seen_paths = set()
+    valid_extensions = {".wav", ".mp3", ".ogg", ".flac", ".m4a"}
 
     for folder in candidate_paths:
         if folder.is_dir():
-            for audio_file in folder.glob("*"):
-                if audio_file.is_file() and audio_file.suffix.lower() in valid_exts:
-                    abs_path = str(audio_file.resolve())
-                    if abs_path not in seen_paths:
-                        seen_paths.add(abs_path)
-                        voice_id = audio_file.stem.lower()
-                        label_name = audio_file.stem.replace("_", " ").replace("-", " ").title()
-                        discovered_voices.append({
-                            "id": voice_id,
-                            "label": f"Voz Preset: {label_name}",
-                            "audio_path": abs_path,
-                        })
+            for file_path in sorted(folder.iterdir()):
+                if file_path.is_file() and file_path.suffix.lower() in valid_extensions:
+                    abs_path = str(file_path.resolve())
+                    if abs_path in seen_paths:
+                        continue
+                    seen_paths.add(abs_path)
+
+                    clean_name = file_path.stem.replace("_", " ").replace("-", " ")
+                    clean_name = re.sub(r"\s+", " ", clean_name).strip().title()
+
+                    txt_path = file_path.with_suffix(".txt")
+                    transcript = ""
+                    if txt_path.is_file():
+                        try:
+                            transcript = sanitize_tts_text(txt_path.read_text(encoding="utf-8-sig"))
+                        except Exception:
+                            pass
+
+                    discovered_voices.append({
+                        "id": file_path.stem,
+                        "name": clean_name,
+                        "label": f"Voz Preset: {clean_name}",
+                        "audio_path": abs_path,
+                        "txt_path": str(txt_path.resolve()) if txt_path.is_file() else "",
+                        "transcript": transcript,
+                        "is_preset": True,
+                    })
 
     return discovered_voices
 
@@ -184,15 +215,16 @@ def list_preset_voices(
 @dataclass
 class AudioMasteringConfig:
     """Configuração de masterização de voz e dinâmica de estúdio."""
-    bass_gain_db: float = 3.0           # Realce de graves no peito (150Hz) — calibrado pela análise espectral
+    bass_gain_db: float = 3.0           # Realce de graves no peito (150Hz)
     treble_gain_db: float = 2.0         # Brilho e clareza vocal (3500Hz)
-    presence_gain_db: float = 1.5       # Presença vocal (2800Hz) — compensa centroide mais baixo do F5-TTS
+    presence_gain_db: float = 1.5       # Presença vocal (2800Hz)
     compressor_threshold: float = -18.0 # Nivelamento dinâmico em dB
     compressor_ratio: float = 2.5       # Razão de compressão
     target_lufs: float = -16.0          # Padrão de loudness da indústria (broadcast/streaming)
-    speech_speed: float = 1.0           # Fator de velocidade selecionado na UI (0.7x a 2.0x)
-    tempo_calibration: float = 1.15     # Calibração acústica nativa — compensado pelo trimming de silêncio inicial
+    speech_speed: float = 1.0           # Fator de velocidade selecionado na UI (1.0 = nativo)
+    tempo_calibration: float = 1.00     # 1.00 = 100% velocidade original real (sem aceleração oculta)
     sentence_pause_seconds: float = 0.80 # Pausa natural e respiro entre frases completas (. ! ?)
+    export_raw_wav: bool = True         # Salva o arquivo WAV puro antes do pós-processamento
     enabled: bool = True
 
     def build_ffmpeg_filter(self) -> str:
@@ -200,9 +232,6 @@ class AudioMasteringConfig:
         if not self.enabled:
             return ""
         filters = []
-        # Time-stretching de estúdio via algoritmo WSOLA do FFmpeg:
-        # Acelera a fala preservando 100% o pitch, a resolução harmônica
-        # e a proporção de pausas naturais, sem comprimir ou distorcer a difusão da IA.
         effective_speed = self.speech_speed * self.tempo_calibration
         if abs(effective_speed - 1.0) > 0.01:
             spd = max(0.5, min(2.0, effective_speed))
@@ -228,10 +257,13 @@ class NarrationJob:
     voice_mode: str = "clone"                     # "clone" | "preset"
     reference_audio_path: Optional[str] = None   # Usado se voice_mode == "clone"
     preset_voice_id: Optional[str] = None        # Usado se voice_mode == "preset"
+    selected_engine: str = "f5-tts"               # Motor TTS selecionado: "f5-tts", "indextts-2", etc.
     split_mode: str = "unico"                     # "separado" | "unico" (para SRT)
-    speech_speed: float = 1.4                     # Velocidade nativa da fala (0.7x a 2.0x)
+    srt_range: Optional[str] = None               # Intervalo ou blocos específicos (ex: "1-10", "1,3,5" ou None para todos)
+    speech_speed: float = 1.00                    # Velocidade nativa da fala (1.00 = original)
     sentence_pause_seconds: float = 0.80          # Pausa natural após ponto final em segundos
     mastering_config: Optional[AudioMasteringConfig] = None
+    export_raw_wav: bool = False                  # Salva versão WAV pura sem masterização (controlado pela UI)
     destination_folder: str = str(Path.home() / "Downloads")
     save_to_source_folder: bool = True
     create_audio_subfolder: bool = False
@@ -415,11 +447,15 @@ class NarrationEngine:
             ]
             if vocal_filter:
                 cmd.extend(["-af", vocal_filter])
-            cmd.extend([
-                "-codec:a", "libmp3lame",
-                "-b:a", "192k",
-                str(out_path),
-            ])
+
+            if out_path.suffix.lower() == ".wav":
+                cmd.extend(["-codec:a", "pcm_s16le", str(out_path)])
+            else:
+                cmd.extend([
+                    "-codec:a", "libmp3lame",
+                    "-b:a", "192k",
+                    str(out_path),
+                ])
 
             _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             proc = subprocess.run(
@@ -474,14 +510,16 @@ class NarrationEngine:
             else:
                 raise ValueError("Nenhuma voz preset encontrada no sistema para modo 'preset'.")
 
-        # 2. Inicializa o motor TTS (com fallback automático se o preferido não estiver instalado)
+        # 2. Inicializa o motor TTS (falha = erro fatal, SEM fallback silencioso)
+        engine_choice = getattr(job, "selected_engine", "f5-tts")
         tts_engine: BaseTTSEngine = get_tts_engine(
             model_profile=self.model_profile,
+            engine_name=engine_choice,
             use_advanced=self.model_profile.enable_indextts_2,
             models_dir=self.models_dir,
         )
-        # Nota: get_tts_engine já chama load_model() e faz fallback automático.
-        # Se nenhum motor estiver instalado, RuntimeError é levantado aqui com instruções claras.
+
+        actual_engine_name = engine_choice.upper()
 
         temp_work_dir = Path(tempfile.mkdtemp(prefix="kmellvox_narration_"))
         generated_outputs: List[str] = []
@@ -501,7 +539,7 @@ class NarrationEngine:
                 job.mastering_config.speech_speed = job.speech_speed
 
             if job.source_format == "txt":
-                notify(0.10, "Iniciando síntese de texto puro...")
+                notify(0.10, f"Iniciando síntese de texto puro com motor [{actual_engine_name}]...")
 
                 base_stem = (
                     Path(job.source_file_path).stem
@@ -525,7 +563,15 @@ class NarrationEngine:
                     sentence_pause_seconds=pause_sec,
                 )
 
-                notify(0.85, f"Masterizando áudio de estúdio ({job.speech_speed:.2f}x WSOLA, graves e dinâmica)...")
+                # Exporta cópia do áudio bruto (.wav sem efeitos) se solicitado
+                if getattr(job, "export_raw_wav", False):
+                    raw_dest_wav = target_dir / f"{base_stem}_raw.wav"
+                    if temp_wav.is_file():
+                        shutil.copyfile(str(temp_wav), str(raw_dest_wav))
+                        generated_outputs.append(str(raw_dest_wav))
+                        logger.info("Áudio bruto exportado para: %s", raw_dest_wav.name)
+
+                notify(0.85, f"Masterizando áudio de estúdio ({job.speech_speed:.2f}x, graves e dinâmica)...")
                 if job.mastering_config is not None:
                     final_mp3 = self._convert_to_mp3(
                         str(temp_wav),
@@ -547,8 +593,14 @@ class NarrationEngine:
                 if not segments:
                     raise ValueError("Nenhum segmento válido encontrado no conteúdo SRT.")
 
+                if job.srt_range:
+                    selected_ids = set(parse_block_ranges(job.srt_range, len(segments)))
+                    segments = [s for s in segments if s.id in selected_ids]
+                    if not segments:
+                        raise ValueError(f"Nenhum bloco SRT correspondeu ao intervalo selecionado: '{job.srt_range}'.")
+
                 total = len(segments)
-                notify(0.10, f"Processando {total} trecho(s) de áudio individuais ({job.speech_speed:.2f}x)...")
+                notify(0.10, f"Processando {total} trecho(s) de áudio selecionados com motor [{actual_engine_name}] ({job.speech_speed:.2f}x)...")
 
                 pause_sec = (
                     job.mastering_config.sentence_pause_seconds
@@ -561,21 +613,29 @@ class NarrationEngine:
                         raise RuntimeError("Operação cancelada pelo usuário.")
 
                     slug = slugify_text(seg.text, max_words=4)
-                    file_name = f"{idx:03d}_{slug}.mp3"
+                    file_name = f"{seg.id:03d}_{slug}.mp3"
                     out_mp3 = target_dir / file_name
-                    temp_seg_wav = temp_work_dir / f"seg_{idx:03d}.wav"
+                    temp_seg_wav = temp_work_dir / f"seg_{seg.id:03d}.wav"
 
                     sub_pct = 0.10 + ((idx / total) * 0.80)
-                    notify(sub_pct, f"Sintetizando trecho {idx}/{total}: '{seg.text[:30]}...'")
+                    notify(sub_pct, f"Sintetizando bloco {seg.id} ({idx}/{total}): '{seg.text[:30]}...'")
 
                     tts_engine.clone_and_synthesize(
                         text=seg.text,
                         reference_audio_path=reference_audio,
                         output_path=str(temp_seg_wav),
-                        target_duration=seg.duration if self.model_profile.enable_indextts_2 else None,
+                        target_duration=None,
                         speed=1.0,
                         sentence_pause_seconds=pause_sec,
                     )
+
+                    # Exporta cópia do áudio bruto (.wav sem efeitos) se solicitado
+                    if getattr(job, "export_raw_wav", False):
+                        raw_seg_wav = target_dir / f"{seg.id:03d}_{slug}_raw.wav"
+                        if temp_seg_wav.is_file():
+                            shutil.copyfile(str(temp_seg_wav), str(raw_seg_wav))
+                            generated_outputs.append(str(raw_seg_wav))
+                            logger.info("Áudio bruto exportado para: %s", raw_seg_wav.name)
 
                     if job.mastering_config is not None:
                         self._convert_to_mp3(
@@ -598,8 +658,14 @@ class NarrationEngine:
                 if not segments:
                     raise ValueError("Nenhum segmento válido encontrado no conteúdo SRT.")
 
+                if job.srt_range:
+                    selected_ids = set(parse_block_ranges(job.srt_range, len(segments)))
+                    segments = [s for s in segments if s.id in selected_ids]
+                    if not segments:
+                        raise ValueError(f"Nenhum bloco SRT correspondeu ao intervalo selecionado: '{job.srt_range}'.")
+
                 total = len(segments)
-                notify(0.10, f"Sintetizando e ajustando ritmo para {total} segmentos ({job.speech_speed:.2f}x)...")
+                notify(0.10, f"Sintetizando e ajustando ritmo para {total} segmentos selecionados com motor [{actual_engine_name}] ({job.speech_speed:.2f}x)...")
 
                 pieces_to_concat: List[str] = []
                 current_timeline_time = 0.0
@@ -630,7 +696,7 @@ class NarrationEngine:
                         text=seg.text,
                         reference_audio_path=reference_audio,
                         output_path=str(temp_speech_wav),
-                        target_duration=seg.duration if self.model_profile.enable_indextts_2 else None,
+                        target_duration=None,
                         speed=1.0,
                         sentence_pause_seconds=pause_sec,
                     )
@@ -647,6 +713,13 @@ class NarrationEngine:
                     else f"narracao_srt_completa_{int(time.time())}"
                 )
                 final_combined_mp3 = target_dir / f"{base_stem}.mp3"
+                # Exporta cópia concatenada bruta (.wav sem efeitos) se solicitado
+                if getattr(job, "export_raw_wav", False):
+                    raw_combined_wav = target_dir / f"{base_stem}_raw.wav"
+                    self._concat_audio_segments(pieces_to_concat, str(raw_combined_wav), mastering_config=None)
+                    generated_outputs.append(str(raw_combined_wav))
+                    logger.info("Áudio contínuo bruto exportado para: %s", raw_combined_wav.name)
+
                 if job.mastering_config is not None:
                     self._concat_audio_segments(
                         pieces_to_concat,
@@ -750,12 +823,14 @@ def list_all_saved_voices(models_dir: str = "models") -> List[Dict[str, Any]]:
 def smart_trim_audio_reference(
     input_audio_path: str,
     output_audio_path: str,
+    min_duration: float = 8.0,
     max_duration: float = 12.0,
     ffmpeg_bin: Optional[str] = None,
 ) -> Tuple[str, float]:
     """
-    Recorta com precisão cirúrgica o áudio de referência para até max_duration segundos,
-    garantindo que NÃO corte no meio de uma palavra, procurando pausas naturais ou pontuação.
+    Recorta com precisão cirúrgica o áudio de referência para a faixa ideal (8s a 12s),
+    garantindo que NÃO corte no meio de uma palavra, analisando energia acústica e pausas naturais
+    de silêncio entre orações.
     
     Returns:
         Tuple[str, float]: (caminho do arquivo WAV recortado a 24kHz mono, duração real em segundos)
@@ -765,40 +840,123 @@ def smart_trim_audio_reference(
     out_p = Path(output_audio_path).resolve()
     out_p.parent.mkdir(parents=True, exist_ok=True)
 
-    dur = get_audio_duration(str(in_p))
-    cut_seconds = min(dur, max_duration)
-
-    # Se a duração já for menor que o limite, apenas converte para WAV 24kHz mono limpo
-    if dur <= max_duration:
+    # 1. Converte áudio completo para WAV mono 24kHz temporário para inspeção precisa
+    temp_conv = out_p.parent / f"_temp_smart_trim_{int(time.time() * 1000)}.wav"
+    try:
         cmd = [
             bin_path, "-y",
             "-i", str(in_p),
             "-ar", "24000", "-ac", "1",
-            str(out_p),
+            str(temp_conv),
         ]
-    else:
-        # Se for maior que 12s, corta preferencialmente entre 5s e 10s no ponto de silêncio
-        # Tenta usar silêncio natural com afilter silencedetect se possível, ou ponto seguro
-        target_cut = min(10.0, cut_seconds)
-        cmd = [
-            bin_path, "-y",
-            "-i", str(in_p),
-            "-to", f"{target_cut:.2f}",
-            "-ar", "24000", "-ac", "1",
-            str(out_p),
-        ]
+        _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+            creationflags=_NO_WINDOW,
+        )
 
-    _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=True,
-        creationflags=_NO_WINDOW,
-    )
+        import numpy as np
+        data, sr = sf.read(str(temp_conv), dtype="float32")
+        dur = len(data) / sr
 
-    real_dur = get_audio_duration(str(out_p))
-    return str(out_p), real_dur
+        # Se já estiver dentro do limite ideal (<= max_duration), mantém integral
+        if dur <= max_duration:
+            shutil.move(str(temp_conv), str(out_p))
+            return str(out_p), dur
+
+        # 2. Análise de energia por janelas (50ms hop, 100ms window) para achar pausas
+        hop = int(0.05 * sr)
+        win = int(0.10 * sr)
+        n_frames = max(1, (len(data) - win) // hop)
+        frame_rms = np.zeros(n_frames, dtype=np.float32)
+        for i in range(n_frames):
+            frame = data[i * hop : i * hop + win]
+            frame_rms[i] = np.sqrt(np.mean(frame**2))
+
+        # Considera silêncio frames com RMS < 0.015
+        silence_threshold = 0.015
+        is_silence = frame_rms < silence_threshold
+
+        # Identifica vales de silêncio contínuo com pelo menos 150ms (3 frames)
+        valleys = []
+        in_v = False
+        v_start = 0
+        for i, s in enumerate(is_silence):
+            if s and not in_v:
+                in_v = True
+                v_start = i
+            elif not s and in_v:
+                in_v = False
+                if (i - v_start) >= 3:
+                    center_frame = (v_start + i) // 2
+                    valleys.append(center_frame * hop / sr)
+        if in_v and (n_frames - v_start) >= 3:
+            valleys.append(((v_start + n_frames) // 2) * hop / sr)
+
+        if not valleys or valleys[0] > 0.5:
+            valleys.insert(0, 0.0)
+
+        # 3. Busca o melhor par de vales [start, end] com duração entre min_duration e max_duration
+        best_candidate = None
+        best_score = -1.0
+
+        for i in range(len(valleys)):
+            t_start = valleys[i]
+            for j in range(i + 1, len(valleys)):
+                t_end = valleys[j]
+                candidate_dur = t_end - t_start
+
+                if min_duration <= candidate_dur <= max_duration:
+                    s_idx = int(t_start * sr)
+                    e_idx = int(t_end * sr)
+                    sub = data[s_idx:e_idx]
+                    cand_rms = np.sqrt(np.mean(sub**2))
+                    dur_score = 1.0 - abs(candidate_dur - 10.5) / 10.5
+                    rms_score = 1.0 - abs(cand_rms - 0.06) / 0.06 if cand_rms > 0.02 else 0.1
+                    score = dur_score * 0.5 + rms_score * 0.5
+
+                    if score > best_score:
+                        best_score = score
+                        best_candidate = (t_start, t_end)
+                elif candidate_dur > max_duration:
+                    break
+
+        if best_candidate is not None:
+            t_start, t_end = best_candidate
+            logger.info(
+                "Recorte inteligente selecionou trecho de %.2fs a %.2fs (duração: %.2fs)",
+                t_start, t_end, t_end - t_start,
+            )
+            cut_data = data[int(t_start * sr) : int(t_end * sr)]
+        else:
+            cut_end = 10.0
+            for v in valleys:
+                if 7.0 <= v <= max_duration:
+                    cut_end = v
+                    break
+            cut_data = data[: int(cut_end * sr)]
+
+        # Aplica micro-fade in/out de 10ms para evitar estalos nas bordas
+        fade_len = int(0.010 * sr)
+        if len(cut_data) >= 2 * fade_len:
+            fade_in = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+            fade_out = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+            cut_data[:fade_len] *= fade_in
+            cut_data[-fade_len:] *= fade_out
+
+        sf.write(str(out_p), cut_data, sr)
+        real_dur = len(cut_data) / sr
+        return str(out_p), real_dur
+
+    finally:
+        if temp_conv.exists():
+            try:
+                os.remove(temp_conv)
+            except Exception:
+                pass
 
 
 def save_cloned_voice(
@@ -818,21 +976,23 @@ def save_cloned_voice(
     target_wav = voices_dir / f"{clean_name}.wav"
     target_txt = voices_dir / f"{clean_name}.txt"
 
-    # Aplica recorte inteligente para o tempo ideal do modelo (max 12s)
+    # Aplica recorte inteligente para o tempo ideal do modelo (8s a 12s)
     smart_trim_audio_reference(
         input_audio_path=audio_path,
         output_audio_path=str(target_wav),
+        min_duration=8.0,
         max_duration=12.0,
     )
 
-    # Salva transcrição de referência se fornecida
+    # Salva transcrição de referência higienizada sem BOM
     if transcript and transcript.strip():
-        clean_txt = transcript.strip()
+        clean_txt = sanitize_tts_text(transcript.strip())
         if not clean_txt.endswith((".", "!", "?")):
             clean_txt += "."
         target_txt.write_text(clean_txt, encoding="utf-8")
-    elif not target_txt.is_file():
-        # Se não forneceu transcrição, cria arquivo vazio para F5-TTS usar auto-ASR
+    else:
+        # Se não forneceu nova transcrição ao atualizar a voz, limpa o arquivo para evitar
+        # que uma transcrição antiga e incompatível com o novo áudio permaneça ativa
         target_txt.write_text("", encoding="utf-8")
 
     return {

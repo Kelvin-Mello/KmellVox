@@ -23,34 +23,34 @@ ui:
     narration_ref_audio: D:\Principal\YouTube\Vozes para Clonar
     narration_source_file: D:\Principal\YouTube\Canais\0001 - Documentário de Cidades\0001
 audio_mastering:
-  last_profile: "Padrao_KmellVox"
+  last_profile: Padrao_KmellVox
   last_speed: 1.0
-  tempo_calibration: 1.15
-  sentence_pause: 0.80
+  tempo_calibration: 1.00
+  sentence_pause: 0.8
   profiles:
     Padrao_KmellVox:
-      name: "Padrão KmellVox (Recomendado)"
-      bass: 3.0
+      name: Padrão KmellVox (Recomendado)
+      bass: 4.5
       treble: 2.0
       compression: 2.5
       loudness: -16.0
       speed: 1.0
     Podcast_Encorpado:
-      name: "Podcast / Narração Encorpada"
+      name: Podcast / Narração Encorpada
       bass: 6.0
       treble: 2.5
       compression: 3.0
       loudness: -15.0
       speed: 1.35
     Clareza_Brilho:
-      name: "Clareza e Brilho"
+      name: Clareza e Brilho
       bass: 2.0
       treble: 4.0
       compression: 2.0
       loudness: -16.0
       speed: 1.45
     Neutro:
-      name: "Neutro / Sem Efeitos"
+      name: Neutro / Sem Efeitos
       bass: 0.0
       treble: 0.0
       compression: 1.0

@@ -4,8 +4,21 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
+
+# CRITICAL: Desabilita TorchScript JIT em executáveis congelados (PyInstaller).
+# O TorchScript exige acesso ao código-fonte .py para compilação JIT,
+# mas o PyInstaller embute apenas bytecode .pyc. Com PYTORCH_JIT=0,
+# @torch.jit.script vira um no-op e o código roda em modo eager sem perda funcional.
+# DEVE ser definido ANTES de qualquer import do torch.
+if getattr(sys, "frozen", False):
+    os.environ["PYTORCH_JIT"] = "0"
+
+# CRITICAL: Previne fragmentação de VRAM no PyTorch (CUDA) em GPUs de 8GB.
+# Permite alocação dinâmica contígua de memória em pipelines de difusão/GPT.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
@@ -55,22 +68,37 @@ def run_cli(args: argparse.Namespace) -> None:
 
 
 def run_gui(first_run: bool = False) -> None:
-    """Inicia a interface gráfica com PySide6."""
+    """Inicia a interface gráfica com PySide6 exibindo tela de carregamento moderna."""
     logger.info("Iniciando KmellVox Studio (PySide6)...")
     app = QApplication(sys.argv)
     app.setApplicationName("KmellVox Studio")
     app.setOrganizationName("KmellVox")
+    app.setQuitOnLastWindowClosed(False)
+
+    # Exibe imediatamente a Splash Screen animada em loop
+    from ui.splash_screen import KmellVoxSplashScreen
+    splash = KmellVoxSplashScreen()
+    splash.show()
+    app.processEvents()
+
+    splash.set_status("Detectando aceleração de GPU e hardware...", 30)
+    app.processEvents()
+
+    splash.set_status("Carregando catálogo de inteligência artificial e interface...", 65)
+    app.processEvents()
 
     window = MainWindow()
 
-    # Exibe a janela totalmente construída antes de qualquer operação pesada.
-    # A detecção de hardware ocorrerá de forma diferida (após o primeiro render),
-    # evitando o efeito de "piscar / abrir e fechar" durante a inicialização.
-    window.show()
+    def _transition() -> None:
+        splash.finish_and_show(window)
+        app.setQuitOnLastWindowClosed(True)
+
+    # Encerra a splash screen e exibe a tela principal
+    QTimer.singleShot(350, _transition)
 
     if first_run:
         # Abre automaticamente a tela de configurações na primeira execução
-        QTimer.singleShot(300, window._open_settings)
+        QTimer.singleShot(700, window._open_settings)
 
     sys.exit(app.exec())
 

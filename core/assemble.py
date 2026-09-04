@@ -298,3 +298,82 @@ def assemble_final_video(
             audio_bitrate=cfg.audio_bitrate,
             progress_callback=progress_callback,
         )
+
+
+def build_timeline_audio(
+    segments: List[Any],
+    total_duration: float,
+    output_path: str,
+    sample_rate: int = 24000,
+) -> str:
+    """
+    Constrói uma faixa contínua de áudio posicionando os segmentos clonados
+    nos seus respectivos timestamps de início (seg.start) e preenchendo os
+    intervalos com silêncio.
+    
+    Args:
+        segments: Lista de ClonedAudioSegment ou dicts com start, end, audio_path.
+        total_duration: Duração total esperada da mídia (segundos).
+        output_path: Caminho do arquivo WAV de saída gerado.
+        sample_rate: Taxa de amostragem (padrão 24000Hz).
+        
+    Returns:
+        str: Caminho do arquivo WAV montado na timeline.
+    """
+    import numpy as np
+    import soundfile as sf
+
+    out_p = Path(output_path).resolve()
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+
+    total_samples = int(max(0.5, total_duration) * sample_rate)
+    for seg in segments:
+        end_sec = getattr(seg, "end", 0.0) if hasattr(seg, "end") else float(seg.get("end", 0.0))
+        seg_samples = int(end_sec * sample_rate)
+        if seg_samples > total_samples:
+            total_samples = seg_samples + int(0.5 * sample_rate)
+
+    timeline = np.zeros(total_samples, dtype=np.float32)
+    fade_len = int(0.005 * sample_rate)  # 5ms micro-fade nas bordas
+    fade_in = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+    fade_out = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+
+    for seg in segments:
+        audio_file = getattr(seg, "audio_path", "") if hasattr(seg, "audio_path") else seg.get("audio_path", "")
+        if not audio_file or not os.path.isfile(audio_file):
+            continue
+
+        try:
+            data, sr = sf.read(audio_file, dtype="float32")
+            if data.ndim > 1:
+                data = data.mean(axis=1)
+
+            if sr != sample_rate:
+                target_len = int(len(data) * sample_rate / sr)
+                data = np.interp(
+                    np.linspace(0, len(data) - 1, target_len),
+                    np.arange(len(data)),
+                    data,
+                ).astype(np.float32)
+
+            if len(data) >= 2 * fade_len:
+                data[:fade_len] *= fade_in
+                data[-fade_len:] *= fade_out
+
+            start_sec = getattr(seg, "start", 0.0) if hasattr(seg, "start") else float(seg.get("start", 0.0))
+            start_idx = max(0, int(start_sec * sample_rate))
+            end_idx = min(total_samples, start_idx + len(data))
+            chunk_len = end_idx - start_idx
+
+            if chunk_len > 0:
+                timeline[start_idx:end_idx] += data[:chunk_len]
+        except Exception as e:
+            logger.warning("Falha ao sobrepor segmento %s na timeline: %s", audio_file, e)
+
+    max_val = np.max(np.abs(timeline)) if len(timeline) > 0 else 0
+    if max_val > 0.99:
+        timeline = timeline / (max_val + 1e-4) * 0.95
+
+    sf.write(str(out_p), timeline, sample_rate)
+    logger.info("Timeline de áudio dublado montada: %s (%.2fs)", out_p.name, len(timeline) / sample_rate)
+    return str(out_p)

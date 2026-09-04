@@ -13,6 +13,8 @@ import re as _re
 import gc
 import logging
 import os
+# CRITICAL: Previne fragmentação de VRAM em GPUs de 8GB
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import shutil
 import subprocess
 from dataclasses import asdict, dataclass
@@ -56,6 +58,22 @@ class ClonedAudioSegment:
         if hasattr(self, key):
             return getattr(self, key)
         raise KeyError(f"Chave '{key}' não encontrada no ClonedAudioSegment.")
+
+
+def sanitize_tts_text(text: str) -> str:
+    """
+    Higieniza o texto para modelos de síntese neural (TTS),
+    removendo caracteres invisíveis (BOM, zero-width spaces)
+    e normalizando espaçamentos que degradam os tokenizers.
+    """
+    if not text:
+        return ""
+    import re
+    # Remove BOM e caracteres invisíveis de largura zero
+    cleaned = re.sub(r"[\ufeff\u200b\u200c\u200d\u2060\ufffe]", "", text)
+    # Normaliza espaços múltiplos
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    return cleaned.strip()
 
 
 def get_audio_duration(file_path: str) -> float:
@@ -579,12 +597,12 @@ class F5TTSEngine(BaseTTSEngine):
         if self._f5_instance is not None:
             try:
                 # Procura transcrição sidecar (.txt) se ref_text não foi fornecido
-                ref_txt = reference_text or ""
+                ref_txt = sanitize_tts_text(reference_text or "")
                 if not ref_txt:
                     txt_sidecar = Path(reference_audio_path).with_suffix(".txt")
                     if txt_sidecar.is_file():
                         try:
-                            full_txt = txt_sidecar.read_text(encoding="utf-8").strip()
+                            full_txt = sanitize_tts_text(txt_sidecar.read_text(encoding="utf-8-sig"))
                             # Se a referência foi recortada, recorta o texto de forma limpa
                             ref_dur = get_audio_duration(reference_audio_path)
                             if ref_dur > _MAX_REF_AUDIO_SECONDS and full_txt:
@@ -612,7 +630,7 @@ class F5TTSEngine(BaseTTSEngine):
                         except Exception:
                             pass
 
-                target_text = text.strip()
+                target_text = sanitize_tts_text(text)
                 if target_text and not target_text.endswith((".", "!", "?", "...", ":")):
                     target_text += "."
                 # Adiciona um espaço suave ao final para dar folga de frames ao Vocos e impedir corte da última palavra
@@ -821,9 +839,12 @@ class F5TTSEngine(BaseTTSEngine):
                 if raw_data.ndim > 1:
                     raw_data = raw_data.mean(axis=1)
 
-                # Trimming de silêncio inicial: detecta onde a fala realmente começa
-                _SILENCE_THRESHOLD = 0.005
-                _HEAD_MARGIN_SEC = 0.01  # 10ms de margem antes da primeira fala
+                # Trimming de silêncio inicial com proteção acústica:
+                # Usa limiar sensível (0.002) e margem generosa de 80ms antes da primeira fala
+                # para garantir que o algoritmo WSOLA (atempo) e compressores nunca cortem
+                # as consoantes ou sílabas iniciais (como 'Look', 'Listen' ou 'Closely').
+                _SILENCE_THRESHOLD = 0.002
+                _HEAD_MARGIN_SEC = 0.08  # 80ms de margem de respiro antes da fala
                 _MIN_REMAINING_SEC = 0.1  # Garante pelo menos 100ms de áudio restante
                 trim_idx = 0
                 for idx in range(len(raw_data)):
@@ -836,10 +857,16 @@ class F5TTSEngine(BaseTTSEngine):
                 # Safety: só aplica trim se sobrar áudio suficiente
                 if trim_start > 0 and (len(raw_data) - trim_start) >= min_remaining:
                     logger.debug(
-                        "Silêncio inicial removido: %d amostras (%.0f ms)",
+                        "Silêncio inicial ajustado: %d amostras (%.0f ms)",
                         trim_start, 1000 * trim_start / raw_sr,
                     )
                     raw_data = raw_data[trim_start:]
+
+                # Micro-fade in de 5ms no início para evitar cliques
+                fade_samples = min(int(0.005 * raw_sr), len(raw_data))
+                if fade_samples > 0:
+                    fade_curve = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
+                    raw_data[:fade_samples] *= fade_curve
 
                 # Tail padding: adiciona 250ms de silêncio suave no final
                 tail_pad = np.zeros(int(0.25 * raw_sr), dtype=np.float32)
@@ -888,10 +915,9 @@ class F5TTSEngine(BaseTTSEngine):
 
 class IndexTTS2Engine(BaseTTSEngine):
     """
-    Motor opcional de alta qualidade (IndexTTS-2), habilitado apenas quando ModelProfile
-    indica perfil_a (8GB+ VRAM).
-    Utiliza inferência em FP16 e controle explícito nativo de duração no tempo certo,
-    sem necessidade de pós-processamento com atempo.
+    Motor opcional de alta qualidade (IndexTTS-2 / 2.5), habilitado para GPUs
+    com 8GB+ de VRAM (Perfil A). Utiliza inferência com separação de timbre
+    e emoção da API oficial do IndexTTS2.
     """
 
     def __init__(
@@ -901,12 +927,8 @@ class IndexTTS2Engine(BaseTTSEngine):
         models_dir: str = "models",
     ) -> None:
         super().__init__(model_profile=model_profile, device=device, models_dir=models_dir)
-        if not self.profile.enable_indextts_2:
-            logger.warning(
-                "IndexTTS2Engine instanciado em perfil '%s'. "
-                "O modo avançado IndexTTS-2 foi projetado para perfil_a (8GB+ VRAM).",
-                self.profile.profile_name,
-            )
+        self.model_dir = str(Path(models_dir).resolve() / "tts" / "indextts-2")
+        self.cfg_path = str(Path(self.model_dir) / "config.yaml")
 
     def load_model(self) -> None:
         """Carrega o modelo IndexTTS-2 com inferência em FP16."""
@@ -915,29 +937,148 @@ class IndexTTS2Engine(BaseTTSEngine):
 
         logger.info("Carregando motor IndexTTS-2 (FP16) no dispositivo '%s'...", self.device)
         try:
-            # Tenta carregar do módulo index_tts ou indextts se instalado/clonado
-            import torch
+            # Compatibilidade de importação para transformers 4.45+
+            # IMPORTANTE: Sobrescreve SEMPRE os módulos, pois o PyInstaller empacota
+            # uma versão do transformers que registra stubs incompatíveis em sys.modules.
+            import sys, types
             try:
-                from index_tts import IndexTTS
-                self.model = IndexTTS(device=self.device, use_fp16=True)
+                from indextts.gpt.transformers_beam_constraints import DisjunctiveConstraint, PhrasalConstraint
+                bc = types.ModuleType("transformers.generation.beam_constraints")
+                bc.DisjunctiveConstraint = DisjunctiveConstraint
+                bc.PhrasalConstraint = PhrasalConstraint
+                sys.modules["transformers.generation.beam_constraints"] = bc
             except ImportError:
-                import indextts
-                self.model = "indextts_loaded"
-            logger.info("Modelo IndexTTS-2 carregado com sucesso em FP16.")
-        except ImportError:
-            logger.warning(
-                "Repositório/pacote 'index-tts' não encontrado no ambiente. "
-                "Instale via o README.md (requer clone do repositório IndexTTS-2 + dependências)."
+                pass
+
+            try:
+                from indextts.gpt.transformers_beam_search import BeamScorer, BeamSearchScorer, ConstrainedBeamSearchScorer
+                bs = types.ModuleType("transformers.generation.beam_search")
+                bs.BeamScorer = BeamScorer
+                bs.BeamSearchScorer = BeamSearchScorer
+                bs.ConstrainedBeamSearchScorer = ConstrainedBeamSearchScorer
+                sys.modules["transformers.generation.beam_search"] = bs
+            except ImportError:
+                pass
+
+            try:
+                import transformers
+                if "modelscope" not in sys.modules:
+                    ms = types.ModuleType("modelscope")
+                    ms.AutoModelForCausalLM = transformers.AutoModelForCausalLM
+                    ms.AutoTokenizer = transformers.AutoTokenizer
+                    sys.modules["modelscope"] = ms
+            except Exception:
+                pass
+
+            # CRITICAL: Desabilita TorchScript JIT em executáveis congelados (PyInstaller).
+            # O TorchScript exige acesso ao código-fonte .py para compilação JIT,
+            # mas o PyInstaller embute apenas bytecode .pyc. Com PYTORCH_JIT=0,
+            # o decorador @torch.jit.script vira um no-op e o código roda em modo
+            # eager (execução direta) sem perda de qualidade ou funcionalidade.
+            if getattr(sys, "frozen", False):
+                os.environ["PYTORCH_JIT"] = "0"
+                logger.info("PYTORCH_JIT=0 definido (modo frozen — TorchScript desabilitado).")
+
+            # CRITICAL: Compatibilidade entre huggingface_hub >= 1.0 e BigVGAN.
+            # O hub 1.29.0 (empacotado pelo PyInstaller) não passa mais 'proxies'
+            # e 'resume_download' ao chamar _from_pretrained, mas o BigVGAN antigo
+            # os exige como keyword-only. Monkey-patch injeta defaults ausentes.
+            try:
+                from indextts.s2mel.modules.bigvgan import bigvgan as _bvg_mod
+                _orig_fp = _bvg_mod.BigVGAN._from_pretrained.__func__
+
+                @classmethod
+                def _patched_from_pretrained(cls, **kwargs):
+                    kwargs.setdefault("proxies", None)
+                    kwargs.setdefault("resume_download", None)
+                    return _orig_fp(cls, **kwargs)
+
+                _bvg_mod.BigVGAN._from_pretrained = _patched_from_pretrained
+                logger.info("Monkey-patch de compatibilidade BigVGAN aplicado.")
+            except Exception as patch_err:
+                logger.warning("Falha ao aplicar patch BigVGAN (pode ser OK): %s", patch_err)
+
+            from indextts.infer_v2 import IndexTTS2
+
+            # CRITICAL: Após o import, as referências locais de BeamSearchScorer em
+            # transformers_generation_utils já resolveram para 'object' (do transformers
+            # empacotado pelo PyInstaller). Precisamos sobrescrever diretamente no módulo.
+            try:
+                from indextts.gpt import transformers_generation_utils as _tgu
+                from indextts.gpt.transformers_beam_search import BeamScorer, BeamSearchScorer, ConstrainedBeamSearchScorer
+                _tgu.BeamScorer = BeamScorer
+                _tgu.BeamSearchScorer = BeamSearchScorer
+                _tgu.ConstrainedBeamSearchScorer = ConstrainedBeamSearchScorer
+                logger.info("Monkey-patch BeamSearchScorer aplicado em transformers_generation_utils.")
+            except Exception as bsp_err:
+                logger.warning("Falha ao aplicar patch BeamSearchScorer: %s", bsp_err)
+
+            try:
+                from indextts.gpt import transformers_generation_utils as _tgu2
+                from indextts.gpt.transformers_beam_constraints import DisjunctiveConstraint, PhrasalConstraint
+                _tgu2.DisjunctiveConstraint = DisjunctiveConstraint
+                _tgu2.PhrasalConstraint = PhrasalConstraint
+            except Exception:
+                pass
+
+            # CRITICAL: Monkey-patch no CFM.solve_euler para prevenir vazamento de VRAM.
+            # O IndexTTS original acumulava tensores 3D intermediários em 'sol = []' durante
+            # os 25 passos de difusão, causando pico de 8GB+ e CUDA OOM em textos longos.
+            try:
+                from indextts.s2mel.modules.flow_matching import CFM as _cfm_cls
+                def _mem_safe_solve_euler(self_cfm, x, x_lens, prompt, mu, style, f0, t_span, inference_cfg_rate=0.5):
+                    import torch
+                    t = t_span[0]
+                    prompt_len = prompt.size(-1)
+                    prompt_x = torch.zeros_like(x)
+                    prompt_x[..., :prompt_len] = prompt[..., :prompt_len]
+                    x[..., :prompt_len] = 0
+                    if self_cfm.zero_prompt_speech_token:
+                        mu[..., :prompt_len] = 0
+                    for step in range(1, len(t_span)):
+                        dt = t_span[step] - t_span[step - 1]
+                        if inference_cfg_rate > 0:
+                            stacked_prompt_x = torch.cat([prompt_x, torch.zeros_like(prompt_x)], dim=0)
+                            stacked_style = torch.cat([style, torch.zeros_like(style)], dim=0)
+                            stacked_mu = torch.cat([mu, torch.zeros_like(mu)], dim=0)
+                            stacked_x = torch.cat([x, x], dim=0)
+                            stacked_t = torch.cat([t.unsqueeze(0), t.unsqueeze(0)], dim=0)
+                            stacked_dphi_dt = self_cfm.estimator(
+                                stacked_x, stacked_prompt_x, x_lens, stacked_t, stacked_style, stacked_mu,
+                            )
+                            dphi_dt, cfg_dphi_dt = stacked_dphi_dt.chunk(2, dim=0)
+                            dphi_dt = (1.0 + inference_cfg_rate) * dphi_dt - inference_cfg_rate * cfg_dphi_dt
+                        else:
+                            dphi_dt = self_cfm.estimator(x, prompt_x, x_lens, t.unsqueeze(0), style, mu)
+                        x = x + dt * dphi_dt
+                        t = t + dt
+                        x[:, :, :prompt_len] = 0
+                    return x
+                _cfm_cls.solve_euler = _mem_safe_solve_euler
+                logger.info("Monkey-patch CFM.solve_euler aplicado com sucesso para contenção de VRAM.")
+            except Exception as cfm_err:
+                logger.warning("Falha ao aplicar monkey-patch CFM.solve_euler: %s", cfm_err)
+
+            dev = self.device if self.device and self.device != "auto" else "cuda"
+            self.model = IndexTTS2(
+                cfg_path=self.cfg_path,
+                model_dir=self.model_dir,
+                use_fp16=True,
+                device=dev,
+                use_qwen_emo=False,
             )
+            logger.info("Modelo IndexTTS-2 carregado com sucesso em FP16.")
+        except Exception as e:
+            logger.error("Falha ao carregar IndexTTS-2: %s", e, exc_info=True)
             self.model = "indextts2_not_installed"
 
     def _check_engine_available(self) -> None:
         """Lança RuntimeError se o IndexTTS-2 não está instalado."""
-        if self.model == "indextts2_not_installed":
+        if self.model == "indextts2_not_installed" or self.model is None:
             raise RuntimeError(
-                "O motor IndexTTS-2 não está instalado neste ambiente.\n"
-                "Para usar clônagem de voz, instale o IndexTTS-2 seguindo as instruções do README.md,\n"
-                "ou instale o F5-TTS (pip install f5-tts torch torchaudio) para o motor padrão."
+                "O motor IndexTTS-2 não está operacional neste ambiente.\n"
+                "Verifique se os pesos em models/tts/indextts-2 estão completos,\n"
+                "ou utilize o motor padrão F5-TTS."
             )
 
     def clone_and_synthesize(
@@ -948,11 +1089,11 @@ class IndexTTS2Engine(BaseTTSEngine):
         target_duration: Optional[float] = None,
         reference_text: Optional[str] = None,
         auto_unload: bool = False,
-        speed: float = 1.4,
+        speed: float = 1.0,
+        **kwargs: Any,
     ) -> ClonedAudioSegment:
         """
-        Sintetiza a fala clonada usando o modo de controle explícito de duração do IndexTTS-2,
-        gerando o áudio já calibrado no tempo exato, sem necessidade de pós-processamento atempo.
+        Sintetiza a fala clonada usando a API oficial do IndexTTS-2 (infer).
         """
         self.load_model()
         self._check_engine_available()
@@ -960,27 +1101,83 @@ class IndexTTS2Engine(BaseTTSEngine):
         final_out = Path(output_path).resolve()
         final_out.parent.mkdir(parents=True, exist_ok=True)
 
-        target_dur = target_duration if target_duration and target_duration > 0 else max(0.5, len(text.split()) * 0.35)
+        target_text = sanitize_tts_text(text)
+        if target_text and not target_text.endswith((".", "!", "?", "...", ":")):
+            target_text += "."
 
         try:
-            if hasattr(self.model, "synthesize_with_duration"):
-                # Chamada nativa com controle de duração em FP16
-                self.model.synthesize_with_duration(
-                    text=text,
-                    ref_audio=reference_audio_path,
-                    target_duration=target_dur,
-                    output_file=str(final_out),
-                    ref_text=reference_text,
-                )
-            else:
-                # IndexTTS-2 instalado mas sem synthesize_with_duration — tenta inferência padrão
-                self.model.infer(
-                    audio_prompt=reference_audio_path,
-                    text=text,
-                    output_path=str(final_out),
-                )
+            # Mapeia sentence_pause_seconds → interval_silence (ms) do IndexTTS-2.
+            # O IndexTTS-2 gera pausas naturais internamente via GPT; interval_silence
+            # controla o espaçamento entre segmentos de texto (~80 tokens).
+            # Clamped entre 100-1200ms para manter naturalidade e pausas de respiração.
+            pause_sec = kwargs.get("sentence_pause_seconds", 0.8)
+            interval_silence_ms = max(200, min(1200, int(pause_sec * 1000)))
+
+            logger.info(
+                "IndexTTS-2 infer: interval_silence=%dms (de pause=%.2fs), texto=%d chars, target_dur=%s",
+                interval_silence_ms, pause_sec, len(target_text),
+                f"{target_duration:.2f}s" if target_duration else "None",
+            )
+
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+            # num_beams=1: Elimina sobrecarga de memória (reduz pico de VRAM de ~8GB para ~6GB)
+            # e evita que a busca em feixe acelere artificialmente a fala comprimindo pausas.
+            # max_text_tokens_per_segment=60: Segmentos equilibrados (~15-20 palavras) que quebram
+            # perfeitamente em pausas de pontuação e respiram naturalmente como na voz original.
+            self.model.infer(
+                spk_audio_prompt=reference_audio_path,
+                text=target_text,
+                output_path=str(final_out),
+                interval_silence=interval_silence_ms,
+                num_beams=1,
+                do_sample=True,
+                top_p=0.8,
+                top_k=30,
+                temperature=0.8,
+                max_text_tokens_per_segment=60,
+                verbose=False,
+            )
+
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
 
             actual_dur = get_audio_duration(str(final_out))
+            target_dur = target_duration or actual_dur
+            speed_factor = 1.0
+
+            # Ajuste de duração via FFmpeg atempo para corresponder ao timing do SRT.
+            # O IndexTTS-2 tende a falar mais rápido que o ritmo original; o time-stretch
+            # desacelera o áudio para encaixar no slot de tempo do segmento SRT.
+            if target_duration and target_duration > 0 and actual_dur > 0:
+                ratio = actual_dur / target_duration
+                # Só aplica se a diferença for significativa (> 5%)
+                if abs(ratio - 1.0) > 0.05:
+                    stretched_out = final_out.with_suffix(".stretched.wav")
+                    speed_factor = adjust_audio_duration_ffmpeg(
+                        input_audio=str(final_out),
+                        output_audio=str(stretched_out),
+                        target_duration=target_duration,
+                        min_speed=0.65,  # Permite desacelerar até 0.65x
+                        max_speed=1.40,  # Permite acelerar até 1.40x
+                    )
+                    # Substitui o original pelo stretched
+                    if stretched_out.is_file():
+                        shutil.move(str(stretched_out), str(final_out))
+                    actual_dur = get_audio_duration(str(final_out))
+                    logger.info(
+                        "IndexTTS-2 time-stretch: %.2fs → %.2fs (fator: %.2fx)",
+                        actual_dur, target_duration, speed_factor,
+                    )
 
             return ClonedAudioSegment(
                 id=0,
@@ -989,9 +1186,8 @@ class IndexTTS2Engine(BaseTTSEngine):
                 audio_path=str(final_out),
                 target_duration=target_dur,
                 actual_duration=actual_dur,
-                speed_factor=1.0,
+                speed_factor=speed_factor,
             )
-
         finally:
             if auto_unload:
                 self.unload_model()
@@ -999,66 +1195,81 @@ class IndexTTS2Engine(BaseTTSEngine):
 
 def get_tts_engine(
     model_profile: Optional[ModelProfile] = None,
+    engine_name: Optional[str] = None,
     use_advanced: bool = False,
     **kwargs: Any,
 ) -> BaseTTSEngine:
     """
     Factory que retorna a engine de síntese e clonagem de voz adequada,
-    com fallback automático caso o motor preferido não esteja instalado.
-    
-    Cadeia de resolução:
-        1. use_advanced=True + perfil_a → IndexTTS2Engine (se instalado)
-        2. Fallback → F5TTSEngine (se instalado)
-        3. Nenhum instalado → RuntimeError com instruções de instalação
-        
-    Args:
-        model_profile: Perfil de hardware detectado (se None, detecta automaticamente).
-        use_advanced: Se True, tenta ativar IndexTTS-2.
-        **kwargs: Parâmetros extras para a engine (device, models_dir, rhythm_config).
-        
-    Returns:
-        BaseTTSEngine: Instância de F5TTSEngine ou IndexTTS2Engine.
-        
-    Raises:
-        RuntimeError: Se nenhum motor TTS estiver instalado no ambiente.
-    """
-    # Garante que o python_env (instalado após boot) esteja no sys.path e DLLs registradas
-    ensure_addon_in_sys_path()
+    com suporte ao catálogo unificado de motores do KmellVox.
 
+    Cadeia de resolução:
+        1. Se engine_name for 'indextts-2' ou use_advanced=True → IndexTTS2Engine
+        2. Se engine_name for 'f5-tts' ou padrão → F5TTSEngine
+        3. Se o motor solicitado falhar → RuntimeError (SEM fallback silencioso)
+
+    IMPORTANTE: Esta factory NUNCA faz fallback silencioso para outro motor.
+    Se o motor solicitado falhar, lança RuntimeError com a razão detalhada.
+    O tratamento de fallback/cancelamento fica a cargo da camada de UI.
+    """
+    ensure_addon_in_sys_path()
     profile = model_profile or ModelProfile.from_profile()
 
-    # --- Tenta o motor avançado IndexTTS-2 (perfil_a com 8GB+) ---
-    if use_advanced and profile.enable_indextts_2:
-        logger.info("Tentando inicializar motor avançado IndexTTS2Engine (perfil_a)...")
+    selected = (engine_name or "").lower().strip()
+    if not selected:
+        if use_advanced and profile.enable_indextts_2:
+            selected = "indextts-2"
+        else:
+            selected = "f5-tts"
+
+    # --- Tenta IndexTTS-2 ---
+    if selected in ("indextts-2", "indextts", "indextts2"):
+        logger.info("Tentando inicializar motor IndexTTS2Engine...")
         try:
             engine = IndexTTS2Engine(model_profile=profile, **kwargs)
             engine.load_model()
             if engine.model and engine.model != "indextts2_not_installed" and not isinstance(engine.model, str):
                 return engine
+            raise RuntimeError(
+                "O motor IndexTTS-2 não pôde ser inicializado.\n\n"
+                "Os pesos ou dependências do IndexTTS-2 não puderam ser carregados.\n"
+                "Verifique se todos os arquivos de modelo estão presentes em models/tts/indextts-2/ "
+                "(incluindo hf_cache/ com modelos auxiliares).\n\n"
+                "A operação foi cancelada. Selecione outro motor ou corrija a instalação."
+            )
+        except RuntimeError:
+            raise
         except Exception as e:
-            logger.warning("IndexTTS-2 indisponível (%s). Utilizando motor padrão F5TTSEngine.", e)
+            logger.error("IndexTTS-2 indisponível: %s", e, exc_info=True)
+            raise RuntimeError(
+                f"O motor IndexTTS-2 falhou ao carregar:\n\n"
+                f"• {e}\n\n"
+                f"A operação foi cancelada. Verifique os logs para detalhes."
+            ) from e
 
-    # --- Tenta o motor padrão F5-TTS ---
-    logger.info("Selecionando motor de clonagem: F5TTSEngine (Perfil: %s).", profile.profile_name)
-    engine = F5TTSEngine(model_profile=profile, **kwargs)
-    engine.load_model()
-    if engine.model != "f5_not_installed":
-        return engine
+    elif selected in ("f5-tts", "f5tts", "f5"):
+        # --- Tenta F5-TTS ---
+        logger.info("Selecionando motor de clonagem: F5TTSEngine (Perfil: %s).", profile.profile_name)
+        engine = F5TTSEngine(model_profile=profile, **kwargs)
+        engine.load_model()
+        if engine.model != "f5_not_installed":
+            return engine
 
+        raise RuntimeError(
+            "O motor F5-TTS não pôde ser inicializado.\n\n"
+            "O pacote 'f5-tts' não está instalado ou os pesos neurais não foram encontrados.\n"
+            "Consulte o Gerenciador de Modelos ou instale via requirements-gpu.txt.\n\n"
+            "A operação foi cancelada."
+        )
 
-    # --- Nenhum motor disponível ---
-    raise RuntimeError(
-        "Nenhum motor de síntese de voz (TTS) está instalado neste ambiente.\n\n"
-        "Para gerar áudio com clonagem de voz, instale pelo menos um dos seguintes:\n\n"
-        "  Opção 1 — F5-TTS (recomendado para começar):\n"
-        "    pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124\n"
-        "    pip install f5-tts\n\n"
-        "  Opção 2 — IndexTTS-2 (alta qualidade, requer 8GB+ VRAM):\n"
-        "    Consulte o README.md para instruções de instalação do IndexTTS-2.\n\n"
-        "  Ou instale todas as dependências de GPU de uma vez:\n"
-        "    pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124\n"
-        "    pip install -r requirements-gpu.txt"
-    )
+    else:
+        # Motor não reconhecido ou não operacional
+        raise RuntimeError(
+            f"O motor '{selected}' não está disponível neste ambiente.\n\n"
+            f"Este motor está em desenvolvimento para futuras versões e ainda não possui "
+            f"inferência integrada no KmellVox.\n\n"
+            f"A operação foi cancelada. Selecione um motor operacional (F5-TTS ou IndexTTS-2)."
+        )
 
 
 # Alias para retrocompatibilidade
